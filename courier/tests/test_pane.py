@@ -1,0 +1,122 @@
+"""Soul Courier — tests for the PaneManager module."""
+
+import time
+from unittest.mock import patch, MagicMock
+from soul_courier.pane import PaneManager
+
+
+def _make_pm(panes=None):
+    return PaneManager(panes or {"fury": "%10", "hawkeye": "%11"})
+
+
+def test_detect_state_dead_no_pane():
+    pm = _make_pm({"fury": "%10"})
+    assert pm.detect_state("nonexistent") == "dead"
+
+
+def test_detect_state_dead_capture_fails():
+    pm = _make_pm()
+    with patch.object(pm, "_tmux_capture", return_value=None):
+        assert pm.detect_state("fury") == "dead"
+
+
+def test_detect_state_crashed():
+    pm = _make_pm()
+    content = "some output\nuser@hostname:~$ \n"
+    with patch.object(pm, "_tmux_capture", return_value=content):
+        assert pm.detect_state("fury") == "crashed"
+
+
+def test_detect_state_idle_prompt():
+    pm = _make_pm()
+    content = "some output\n\u276f \nstatus bar line"
+    with patch.object(pm, "_tmux_capture", return_value=content):
+        assert pm.detect_state("fury") == "idle"
+
+
+def test_detect_state_idle_ascii_prompt():
+    pm = _make_pm()
+    content = "some output\n> \nstatus bar"
+    with patch.object(pm, "_tmux_capture", return_value=content):
+        assert pm.detect_state("fury") == "idle"
+
+
+def test_detect_state_crunched():
+    pm = _make_pm()
+    content = "Crunched previous messages\n\u276f \nstatus"
+    with patch.object(pm, "_tmux_capture", return_value=content):
+        assert pm.detect_state("fury") == "crunched"
+
+
+def test_detect_state_cache_hit():
+    pm = _make_pm()
+    content = "\u276f \nstatus"
+    with patch.object(pm, "_tmux_capture", return_value=content) as mock_cap:
+        assert pm.detect_state("fury") == "idle"
+        assert pm.detect_state("fury") == "idle"
+        assert mock_cap.call_count == 1
+
+
+def test_detect_state_cache_expired():
+    pm = _make_pm()
+    content = "\u276f \nstatus"
+    with patch.object(pm, "_tmux_capture", return_value=content) as mock_cap:
+        assert pm.detect_state("fury") == "idle"
+        pm._state_cache["fury"] = ("idle", time.monotonic() - 5.0)
+        assert pm.detect_state("fury") == "idle"
+        assert mock_cap.call_count == 2
+
+
+def test_inject_uses_named_buffer():
+    pm = _make_pm()
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0)
+        result = pm.inject("fury", "hello world")
+        assert result is True
+        load_call = mock_run.call_args_list[0]
+        assert "-b" in load_call.args[0]
+        assert "courier-fury" in load_call.args[0]
+
+
+def test_verify_injection_success():
+    pm = _make_pm()
+    with patch.object(pm, "_tmux_capture", return_value="[INBOX] From: team-lead | blah"):
+        with patch("time.sleep"):
+            assert pm.verify_injection("fury", "From: team-lead") is True
+
+
+def test_verify_injection_failure():
+    pm = _make_pm()
+    with patch.object(pm, "_tmux_capture", return_value="some unrelated output"):
+        with patch("time.sleep"):
+            assert pm.verify_injection("fury", "From: team-lead") is False
+
+
+def test_update_panes_preserves_locks():
+    pm = _make_pm()
+    old_lock = pm.locks["fury"]
+    pm.update_panes({"fury": "%20", "loki": "%21"})
+    assert pm.panes["fury"] == "%20"
+    assert pm.panes["loki"] == "%21"
+    assert "hawkeye" not in pm.panes
+    # Old lock preserved for fury (not recreated)
+    assert pm.locks["fury"] is old_lock
+    # New lock created for loki
+    assert "loki" in pm.locks
+
+
+def test_mark_dead():
+    pm = _make_pm()
+    pm.mark_dead("fury")
+    assert pm.detect_state("fury") == "dead"
+
+
+def test_invalidate_cache():
+    pm = _make_pm()
+    content = "\u276f \nstatus"
+    with patch.object(pm, "_tmux_capture", return_value=content) as mock_cap:
+        pm.detect_state("fury")
+        assert mock_cap.call_count == 1
+        pm.invalidate_cache("fury")
+        pm.detect_state("fury")
+        assert mock_cap.call_count == 2

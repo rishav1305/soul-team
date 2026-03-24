@@ -1,0 +1,52 @@
+# Single-machine cluster configuration
+# All agents run on the local machine — no SSH required.
+#
+# Usage:
+#   cp examples/single-machine/cluster.yaml ~/.config/soul-team/cluster.yaml
+#   soul-team --all
+
+team:
+  name: my-team
+  session: soul-session
+  data_dir: ~/.local/share/soul-team
+
+machines:
+  primary:
+    host: localhost
+    user: ~          # Uses current user
+    mode: local      # 'local' means no SSH, run directly
+    cgroup_slice: soul-agents.slice
+    guardian:
+      cpu_limit_pct: 80
+      mem_limit_mb: 4096
+      temp_warn_c: 75
+      temp_kill_c: 85
+
+# All agents run on the primary machine
+agents:
+  - name: assistant
+    machine: primary
+    prompt_file: agents/assistant.md
+    description: "Personal assistant — scheduling, tasks, briefings"
+
+  - name: developer
+    machine: primary
+    prompt_file: agents/developer.md
+    description: "Technical builder — code, tests, CI"
+
+  - name: researcher
+    machine: primary
+    prompt_file: agents/researcher.md
+    description: "Market intelligence — competitive analysis, research briefs"
+
+# Optional: model overrides per agent
+# models:
+#   assistant: claude-haiku-4-5
+#   developer: claude-sonnet-4-5
+#   researcher: claude-sonnet-4-5
+
+# Courier message bus
+courier:
+  inbox_dir: ~/.local/share/soul-team/inbox
+  broadcast_dir: ~/.local/share/soul-team/broadcast
+  poll_interval_ms: 500

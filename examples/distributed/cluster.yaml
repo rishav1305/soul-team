@@ -1,0 +1,83 @@
+# Distributed cluster configuration
+# Agents split across two machines: a primary (always-on) and a worker (high compute).
+#
+# Architecture:
+#   primary-host   — always-on (e.g., Raspberry Pi, home server, cloud VM)
+#                    runs: assistant, researcher (low-CPU agents)
+#                    hosts: tmux session visible on monitor
+#   worker-host    — high-compute (e.g., desktop, workstation, cloud instance)
+#                    runs: developer (CPU-intensive builds, tests)
+#
+# Usage:
+#   cp examples/distributed/cluster.yaml ~/.config/soul-team/cluster.yaml
+#   # Edit host/user values below to match your machines
+#   soul-team --all
+#
+# Prerequisites on worker-host:
+#   - SSH key-based auth from primary-host → worker-host
+#   - Claude CLI installed and authenticated
+#   - soul-team installed (run setup.sh on worker-host too)
+
+team:
+  name: my-team
+  session: soul-session
+  data_dir: ~/.local/share/soul-team
+
+machines:
+  # Primary: always-on, low-power machine
+  primary:
+    host: 10.0.0.1          # Change to your primary machine's IP or hostname
+    user: myuser             # Change to your username
+    mode: local              # Agents on this machine run directly (not via SSH)
+    cgroup_slice: soul-agents.slice
+    guardian:
+      cpu_limit_pct: 70       # Lower limit for low-power hardware
+      mem_limit_mb: 2048
+      temp_warn_c: 70
+      temp_kill_c: 80
+
+  # Worker: high-compute machine for heavy tasks
+  worker:
+    host: 10.0.0.2           # Change to your worker machine's IP or hostname
+    user: myuser              # Change to your username
+    mode: ssh                 # Agents on this machine launch via SSH
+    ssh_key: ~/.ssh/id_ed25519  # Optional: explicit key path
+    cgroup_slice: soul-agents.slice
+    guardian:
+      cpu_limit_pct: 85
+      mem_limit_mb: 8192
+      temp_warn_c: 80
+      temp_kill_c: 90
+
+# Agent placement: assign each agent to a machine
+agents:
+  - name: assistant
+    machine: primary          # Low-CPU — runs on always-on machine
+    prompt_file: agents/assistant.md
+    description: "Personal assistant — scheduling, tasks, briefings"
+
+  - name: researcher
+    machine: primary          # Mostly I/O bound — fine on primary
+    prompt_file: agents/researcher.md
+    description: "Market intelligence — competitive analysis, research briefs"
+
+  - name: developer
+    machine: worker           # CPU-intensive builds → dedicated compute
+    prompt_file: agents/developer.md
+    description: "Technical builder — code, tests, CI"
+
+# Courier message bus — shared via sshfs or network filesystem
+# Option A: sshfs mount (primary mounts worker's inbox dir)
+# Option B: network filesystem (NFS/SMB)
+# Option C: Redis pub/sub (set courier.backend: redis)
+courier:
+  inbox_dir: ~/.local/share/soul-team/inbox
+  broadcast_dir: ~/.local/share/soul-team/broadcast
+  poll_interval_ms: 500
+  # backend: filesystem   # 'filesystem' (default) or 'redis'
+  # redis_url: redis://10.0.0.1:6379
+
+# MCP server (optional — enables tool use between agents)
+# mcp:
+#   host: 10.0.0.1
+#   port: 9000

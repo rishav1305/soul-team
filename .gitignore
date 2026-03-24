@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Config (contains sensitive data)
+cluster.yaml
+*.local.yaml
+.env
+.env.*
+!.env.example
+
+# Secrets
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Runtime state
+*.pid
+*.sock
+*.log
+logs/
+
+# Tmux
+*.panes.json
+.panes.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.prof
+
+# Distribution
+*.tar.gz
+*.zip
+
+# Node (if any tooling)
+node_modules/
+npm-debug.log*
+
+# Guardian cache
+guardian_state.json
+agent_snapshots/

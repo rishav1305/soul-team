@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+# soul-team — Launch a distributed Claude agent team
+#
+# Usage:
+#   soul-team                            # Launch all agents (default)
+#   soul-team --config PATH              # Use custom cluster.yaml location
+#   soul-team --agents a,b,c             # Launch only named agents
+#   soul-team --all                      # Explicit all (same as no flags)
+#   soul-team --continue                 # Reattach + heal + revive dead agents
+#
+# Layout adapts dynamically to agent count:
+#   1-3 agents: lead + 1 column
+#   4-6 agents: lead + 2 columns
+#   7+  agents: lead + 3 columns
+#
+# Agents launch in INTERACTIVE mode (TUI) with staggered startup.
+# Trust prompt auto-accepted. Boot prompt typed after TUI loads.
+#
+# Features:
+#   - Reads cluster.yaml for all agent + machine config (no hardcoded values)
+#   - Dynamic tmux layout based on selected agent count
+#   - Conditional SSH (skipped when only local agents selected)
+#   - Scoped panes.json written for courier daemon
+#   - Global daemons start after agents (courier, guardian, heartbeat, router)
+#   - Requires: bash, tmux, python3 (with PyYAML), jq, ssh (for remote agents)
+#
+# Config file search order:
+#   1. --config PATH flag
+#   2. $SOUL_TEAM_CONFIG environment variable
+#   3. ~/.config/soul-team/cluster.yaml
+#   4. ./cluster.yaml (current directory)
+#
+# Install directory (for daemon binaries):
+#   $SOUL_TEAM_DIR or ~/.local/share/soul-team/
+
+set -euo pipefail
+
+# ── Config file resolution ────────────────────────────────────────────────────
+CONFIG_FILE=""
+
+# Handle --config as a pre-pass (before full arg parsing) so it can appear anywhere
+for (( i=1; i<=$#; i++ )); do
+    if [[ "${!i}" == "--config" ]]; then
+        j=$(( i + 1 ))
+        CONFIG_FILE="${!j}"
+        break
+    fi
+done
+
+if [[ -z "$CONFIG_FILE" ]]; then
+    CONFIG_FILE="${SOUL_TEAM_CONFIG:-$HOME/.config/soul-team/cluster.yaml}"
+fi
+if [ ! -f "$CONFIG_FILE" ] && [ -f "./cluster.yaml" ]; then
+    CONFIG_FILE="./cluster.yaml"
+fi
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: cluster.yaml not found." >&2
+    echo "  Checked: $CONFIG_FILE" >&2
+    echo "  Set SOUL_TEAM_CONFIG or pass --config PATH" >&2
+    exit 1
+fi
+
+# ── Install dir for daemon binaries ──────────────────────────────────────────
+SOUL_TEAM_DIR="${SOUL_TEAM_DIR:-$HOME/.local/share/soul-team}"
+
+# ── Read team config from YAML ────────────────────────────────────────────────
+TEAM_NAME=$(python3 -c "
+import yaml, sys
+c = yaml.safe_load(open('$CONFIG_FILE'))
+print(c.get('team', {}).get('name', 'soul-team'))
+" 2>/dev/null || echo "soul-team")
+
+SESSION="$TEAM_NAME"
+
+BOOT=$(python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+print(c.get('team', {}).get('boot_prompt', 'Run your daily routine then enter proactive mode when idle.'))
+" 2>/dev/null || echo "Run your daily routine then enter proactive mode when idle.")
+
+DELAY=$(python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+print(c.get('team', {}).get('stagger_seconds', 10))
+" 2>/dev/null || echo "10")
+
+echo "Config loaded from $CONFIG_FILE (team=${TEAM_NAME}, stagger=${DELAY}s)"
+
+# ── Extract agent list from YAML ──────────────────────────────────────────────
+ALL_AGENTS_STR=$(python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+print(' '.join(a['name'] for a in c.get('agents', [])))
+" 2>/dev/null)
+
+if [[ -z "$ALL_AGENTS_STR" ]]; then
+    echo "Error: no agents found in $CONFIG_FILE" >&2
+    exit 1
+fi
+read -ra ALL_AGENTS <<< "$ALL_AGENTS_STR"
+
+# ── Build agent → machine map ─────────────────────────────────────────────────
+declare -A AGENT_MACHINE
+eval "$(python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+for a in c.get('agents', []):
+    machine = a.get('machine', 'primary')
+    print(f'AGENT_MACHINE[{a[\"name\"]}]={machine}')
+" 2>/dev/null)"
+
+# ── Build agent → model map ───────────────────────────────────────────────────
+declare -A AGENT_MODEL
+eval "$(python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+for a in c.get('agents', []):
+    model = a.get('model', 'sonnet')
+    print(f'AGENT_MODEL[{a[\"name\"]}]={model}')
+" 2>/dev/null)"
+
+# ── panes.json path (under soul-team data dir) ────────────────────────────────
+PANES_JSON="$SOUL_TEAM_DIR/teams/${TEAM_NAME}/panes.json"
+
+# ── Worker SSH helper ─────────────────────────────────────────────────────────
+get_worker_ssh() {
+    local machine="$1"
+    python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+m = c.get('machines', {}).get('$machine', {})
+user = m.get('user', '$(whoami)')
+host = m.get('host', 'localhost')
+print(f'{user}@{host}')
+" 2>/dev/null
+}
+
+get_worker_ssh_key() {
+    local machine="$1"
+    python3 -c "
+import yaml, os
+c = yaml.safe_load(open('$CONFIG_FILE'))
+m = c.get('machines', {}).get('$machine', {})
+key = m.get('ssh_key', '')
+if key:
+    print(os.path.expanduser(key))
+" 2>/dev/null
+}
+
+# ── Cgroup config helper ──────────────────────────────────────────────────────
+get_primary_cgroup_enabled() {
+    python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+primary = c.get('machines', {}).get('primary', {})
+print('true' if primary.get('cgroup', False) else 'false')
+" 2>/dev/null || echo "false"
+}
+
+get_primary_cgroup_slice() {
+    python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+primary = c.get('machines', {}).get('primary', {})
+print(primary.get('cgroup_slice', 'soul-agents.slice'))
+" 2>/dev/null || echo "soul-agents.slice"
+}
+
+# ── Cleanup stale processes ───────────────────────────────────────────────────
+cleanup_stale() {
+    echo "Cleaning up stale processes..."
+    pkill -f "soul-sidecar" 2>/dev/null || true
+    systemctl --user stop soul-courier.service 2>/dev/null || true
+    systemctl --user stop soul-router.service 2>/dev/null || true
+    pkill -f "soul-router" 2>/dev/null || true
+    pkill -f "soul-courier" 2>/dev/null || true
+    pkill -f "soul-heartbeat" 2>/dev/null || true
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+    # Clear per-agent queue files
+    local queue_dir="$SOUL_TEAM_DIR/teams/${TEAM_NAME}/queue"
+    if [ -d "$queue_dir" ]; then
+        for f in "$queue_dir"/*.json; do
+            [ -f "$f" ] && echo '[]' > "$f"
+        done
+    fi
+    echo "Cleanup done."
+}
+
+# ── Get agent launch command (for --continue revive) ─────────────────────────
+get_agent_launch_cmd() {
+    local agent="$1"
+    local model="${AGENT_MODEL[$agent]:-sonnet}"
+    local machine="${AGENT_MACHINE[$agent]:-primary}"
+    local use_cgroup
+    use_cgroup=$(get_primary_cgroup_enabled)
+    local slice
+    slice=$(get_primary_cgroup_slice)
+
+    if [[ "$machine" == "primary" ]]; then
+        if [[ "$use_cgroup" == "true" ]]; then
+            echo "export SOUL_AGENT_NAME=${agent} SOUL_TEAM_NAME=${TEAM_NAME} && systemd-run --user --slice=${slice} --scope claude --dangerously-skip-permissions --agent ${agent}"
+        else
+            echo "export SOUL_AGENT_NAME=${agent} SOUL_TEAM_NAME=${TEAM_NAME} && claude --dangerously-skip-permissions --agent ${agent}"
+        fi
+    else
+        local ssh_dest
+        ssh_dest=$(get_worker_ssh "$machine")
+        local ssh_key
+        ssh_key=$(get_worker_ssh_key "$machine")
+        local ssh_opts="-t"
+        [[ -n "$ssh_key" ]] && ssh_opts="-t -i $ssh_key"
+        echo "ssh $ssh_opts $ssh_dest 'export SOUL_AGENT_NAME=${agent} SOUL_TEAM_NAME=${TEAM_NAME} && claude --dangerously-skip-permissions --agent ${agent}'"
+    fi
+}
+
+# ── --continue mode: reattach + heal + revive ─────────────────────────────────
+if [[ "${1:-}" == "--continue" ]]; then
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "No ${SESSION} session found. Run 'soul-team' to start fresh."
+        exit 1
+    fi
+    echo "Continuing ${SESSION} session..."
+
+    # Phase 2: Heal — restart courier with fresh pane validation
+    systemctl --user restart soul-courier.service 2>/dev/null || true
+
+    # Restart router if not running
+    if ! systemctl --user is-active soul-router.service >/dev/null 2>&1; then
+        local_router="$SOUL_TEAM_DIR/soul-router.py"
+        if [ -f "$local_router" ]; then
+            mkdir -p "$SOUL_TEAM_DIR/logs"
+            python3 "$local_router" >> "$SOUL_TEAM_DIR/logs/soul-router.log" 2>&1 &
+            echo "  Router restarted (PID: $!)"
+        fi
+    fi
+
+    # Phase 3: Revive dead agents
+    if [ -f "$PANES_JSON" ] && command -v jq >/dev/null 2>&1; then
+        for agent in $(jq -r 'keys[]' "$PANES_JSON"); do
+            pane_id=$(jq -r ".\"$agent\"" "$PANES_JSON")
+            content=$(tmux capture-pane -p -t "$pane_id" -S -5 2>/dev/null) || true
+
+            # Dead pane shows a bare shell prompt
+            if [ $? -ne 0 ] || echo "$content" | grep -qE '^\$\s*$|^[a-z]+@[a-zA-Z0-9-]+[^>]*\$\s*$'; then
+                echo "  Reviving ${agent} in pane ${pane_id}..."
+                launch_cmd=$(get_agent_launch_cmd "$agent")
+                tmux send-keys -t "$pane_id" "$launch_cmd" Enter
+            else
+                echo "  ${agent}: alive"
+            fi
+        done
+    fi
+
+    # Phase 4: Attach
+    echo "Attaching to ${SESSION}..."
+    tmux attach-session -t "$SESSION"
+    exit 0
+fi
+
+# ── Parse CLI flags ───────────────────────────────────────────────────────────
+SELECTED_AGENTS=()
+USE_ALL=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config)
+            # Already handled above; skip both tokens
+            shift 2
+            ;;
+        --agents)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                echo "Error: --agents requires a comma-separated list of agent names" >&2
+                exit 1
+            fi
+            IFS=',' read -ra SELECTED_AGENTS <<< "$2"
+            shift 2
+            ;;
+        --all)
+            USE_ALL=true
+            shift
+            ;;
+        --continue)
+            # Already handled above
+            shift
+            ;;
+        *)
+            echo "Unknown flag: $1" >&2
+            echo "Usage: soul-team [--config PATH] [--agents a,b,c] [--all] [--continue]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# --all always overrides explicit list
+if $USE_ALL; then
+    SELECTED_AGENTS=()
+fi
+
+# Empty = all agents (backward-compatible default)
+if [[ ${#SELECTED_AGENTS[@]} -eq 0 ]]; then
+    SELECTED_AGENTS=("${ALL_AGENTS[@]}")
+fi
+
+# Deduplicate (preserving first-seen order)
+declare -A _seen
+DEDUPED=()
+for agent in "${SELECTED_AGENTS[@]}"; do
+    if [[ -z "${_seen[$agent]:-}" ]]; then
+        _seen[$agent]=1
+        DEDUPED+=("$agent")
+    fi
+done
+SELECTED_AGENTS=("${DEDUPED[@]}")
+
+# Validate all requested agents exist in config
+for agent in "${SELECTED_AGENTS[@]}"; do
+    if [[ -z "${AGENT_MACHINE[$agent]:-}" ]]; then
+        echo "Error: unknown agent '${agent}'. Valid agents: ${ALL_AGENTS[*]}" >&2
+        exit 1
+    fi
+done
+if [[ ${#SELECTED_AGENTS[@]} -eq 0 ]]; then
+    echo "Error: no agents specified" >&2
+    exit 1
+fi
+
+echo "Selected agents (${#SELECTED_AGENTS[@]}): ${SELECTED_AGENTS[*]}"
+
+# ── Dynamic layout ────────────────────────────────────────────────────────────
+# PANE_MAP and LEAD_PANE are declared at top level so they're accessible
+# after the function returns.
+declare -A PANE_MAP
+LEAD_PANE=""
+
+create_dynamic_layout() {
+    local num=${#SELECTED_AGENTS[@]}
+    local cols
+
+    if   (( num <= 3 )); then cols=1
+    elif (( num <= 6 )); then cols=2
+    else                       cols=3
+    fi
+
+    cleanup_stale
+
+    # Create session — initial pane becomes the lead/orchestrator pane
+    tmux new-session -d -s "$SESSION" -n "soul"
+    LEAD_PANE=$(tmux display-message -t "$SESSION" -p '#{pane_id}')
+
+    # Horizontal splits: lead keeps 25%, agents share 75%
+    local -a H_SPLITS_1=(75)
+    local -a H_SPLITS_2=(75 50)
+    local -a H_SPLITS_3=(75 66 50)
+
+    local -a col_panes=()
+    local splits_ref="H_SPLITS_${cols}[@]"
+    local -a splits=("${!splits_ref}")
+
+    local last_pane="$LEAD_PANE"
+    for (( c=0; c<cols; c++ )); do
+        tmux split-window -h -t "$last_pane" -l "${splits[$c]}%"
+        col_panes[$c]=$(tmux display-message -t "$SESSION" -p '#{pane_id}')
+        last_pane="${col_panes[$c]}"
+    done
+
+    # Round-robin assign agents to columns
+    local -a col_agents=()
+    for (( c=0; c<cols; c++ )); do col_agents[$c]=""; done
+    for (( i=0; i<num; i++ )); do
+        local c_idx=$(( i % cols ))
+        col_agents[$c_idx]+="${SELECTED_AGENTS[$i]} "
+    done
+
+    # Vertical splits within each column
+    for (( c=0; c<cols; c++ )); do
+        local -a agents_in_col=(${col_agents[$c]})
+        local n_rows=${#agents_in_col[@]}
+        local -a row_panes=("${col_panes[$c]}")
+
+        if (( n_rows == 2 )); then
+            tmux split-window -v -t "${col_panes[$c]}" -l '50%'
+            row_panes+=($(tmux display-message -t "$SESSION" -p '#{pane_id}'))
+        elif (( n_rows == 3 )); then
+            local mid
+            mid=$(tmux split-window -v -t "${col_panes[$c]}" -l '66%' -P -F '#{pane_id}')
+            tmux split-window -v -t "$mid" -l '50%'
+            local bot
+            bot=$(tmux display-message -t "$SESSION" -p '#{pane_id}')
+            row_panes+=("$mid" "$bot")
+        fi
+
+        for (( r=0; r<n_rows; r++ )); do
+            PANE_MAP["${agents_in_col[$r]}"]="${row_panes[$r]}"
+            local title="${agents_in_col[$r]^}"
+            if [[ "${AGENT_MACHINE[${agents_in_col[$r]}]}" != "primary" ]]; then
+                title+="*"  # asterisk marks remote agents
+            fi
+            tmux select-pane -t "${row_panes[$r]}" -T "$title"
+        done
+    done
+
+    tmux select-pane -t "$LEAD_PANE" -T "Lead"
+}
+
+# ── Init team data directories ────────────────────────────────────────────────
+echo "Initializing team data directories..."
+mkdir -p "$SOUL_TEAM_DIR/teams/${TEAM_NAME}/"{queue,broadcast,discussions,sidecar,inboxes}
+mkdir -p "$SOUL_TEAM_DIR/heartbeat"
+mkdir -p "$SOUL_TEAM_DIR/logs"
+
+for agent in "${ALL_AGENTS[@]}"; do
+    inbox_file="$SOUL_TEAM_DIR/teams/${TEAM_NAME}/inboxes/${agent}.json"
+    [ -f "$inbox_file" ] || echo '[]' > "$inbox_file"
+done
+echo "Team data directories ready."
+
+# ── Pre-flight: SSH check if remote agents are selected ───────────────────────
+NEEDS_REMOTE=false
+for agent in "${SELECTED_AGENTS[@]}"; do
+    if [[ "${AGENT_MACHINE[$agent]}" != "primary" ]]; then
+        NEEDS_REMOTE=true
+        break
+    fi
+done
+
+if $NEEDS_REMOTE; then
+    echo "Remote agents selected — verifying SSH connectivity..."
+    # Collect unique remote machines
+    declare -A _checked_machines
+    for agent in "${SELECTED_AGENTS[@]}"; do
+        m="${AGENT_MACHINE[$agent]}"
+        if [[ "$m" != "primary" && -z "${_checked_machines[$m]:-}" ]]; then
+            _checked_machines[$m]=1
+            ssh_dest=$(get_worker_ssh "$m")
+            ssh_key=$(get_worker_ssh_key "$m")
+            ssh_opts="-o ConnectTimeout=5 -o BatchMode=yes"
+            [[ -n "$ssh_key" ]] && ssh_opts="$ssh_opts -i $ssh_key"
+            if ssh $ssh_opts "$ssh_dest" true 2>/dev/null; then
+                echo "  ${m} (${ssh_dest}): reachable"
+            else
+                echo "  Warning: ${m} (${ssh_dest}) not reachable — agents on this machine may fail"
+            fi
+        fi
+    done
+else
+    echo "All agents are local — skipping remote pre-flight."
+fi
+
+# ── Create dynamic layout ─────────────────────────────────────────────────────
+echo "Creating layout (${#SELECTED_AGENTS[@]} agents)..."
+create_dynamic_layout
+
+# ── UI styling ────────────────────────────────────────────────────────────────
+tmux set-option -t "$SESSION" pane-border-status top
+tmux set-option -t "$SESSION" pane-border-format " #{pane_title} "
+tmux set-option -t "$SESSION" pane-active-border-style "fg=#e8a849"
+tmux set-option -t "$SESSION" pane-border-style "fg=#444444"
+tmux set-option -t "$SESSION" mouse on
+tmux set-option -t "$SESSION" status on
+tmux set-option -t "$SESSION" status-interval 10
+tmux set-option -t "$SESSION" status-style "bg=#1a1a2e,fg=#e8a849"
+tmux set-option -t "$SESSION" status-left-length 100
+tmux set-option -t "$SESSION" status-right-length 60
+tmux set-option -t "$SESSION" status-left " ${TEAM_NAME^^} │ ${#SELECTED_AGENTS[@]} agents "
+tmux set-option -t "$SESSION" status-right " %H:%M │ Ctrl+B z zoom "
+
+# ── Write scoped panes.json (lead + selected agents) ─────────────────────────
+{
+    echo "{"
+    echo "  \"lead\": \"${LEAD_PANE}\""
+    for agent in "${SELECTED_AGENTS[@]}"; do
+        echo ", \"${agent}\": \"${PANE_MAP[$agent]}\""
+    done
+    echo "}"
+} | python3 -c "
+import json, sys, os
+panes = json.load(sys.stdin)
+out_path = os.path.expanduser('${PANES_JSON}')
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+with open(out_path, 'w') as f:
+    json.dump(panes, f, indent=2)
+print(f'panes.json written: {out_path} ({len(panes)} entries)')
+"
+
+# ── Launch lead agent immediately ─────────────────────────────────────────────
+sleep 1
+tmux send-keys -t "$LEAD_PANE" \
+    "export SOUL_AGENT_NAME=lead SOUL_TEAM_NAME=${TEAM_NAME} && claude --dangerously-skip-permissions" \
+    Enter
+tmux select-pane -t "$LEAD_PANE"
+
+echo ""
+echo "  Lead agent ready. ${#SELECTED_AGENTS[@]} agents launching with ${DELAY}s stagger..."
+echo "  Selected: ${SELECTED_AGENTS[*]}"
+echo ""
+
+# ── Agent launch functions ────────────────────────────────────────────────────
+launch_local_agent() {
+    local PANE=$1
+    local AGENT=$2
+    local USE_CGROUP
+    USE_CGROUP=$(get_primary_cgroup_enabled)
+    local SLICE
+    SLICE=$(get_primary_cgroup_slice)
+
+    if [[ "$USE_CGROUP" == "true" ]]; then
+        tmux send-keys -t "$PANE" \
+            "export SOUL_AGENT_NAME=${AGENT} SOUL_TEAM_NAME=${TEAM_NAME} && systemd-run --user --slice=${SLICE} --scope claude --dangerously-skip-permissions --agent ${AGENT}" \
+            Enter
+    else
+        tmux send-keys -t "$PANE" \
+            "export SOUL_AGENT_NAME=${AGENT} SOUL_TEAM_NAME=${TEAM_NAME} && claude --dangerously-skip-permissions --agent ${AGENT}" \
+            Enter
+    fi
+
+    # Wait for trust prompt or TUI to load
+    sleep 8
+    # Accept trust prompt if present (Enter is harmless if TUI already loaded)
+    tmux send-keys -t "$PANE" Enter
+    # Wait for TUI to fully load
+    sleep 5
+    # Send boot prompt with agent identity injected
+    local AGENT_BOOT="${BOOT} (You are ${AGENT}. Before your daily routine, check your inbox.)"
+    tmux send-keys -t "$PANE" "$AGENT_BOOT" Enter
+}
+
+launch_remote_agent() {
+    local PANE=$1
+    local AGENT=$2
+    local MACHINE="${AGENT_MACHINE[$AGENT]}"
+    local SSH_DEST
+    SSH_DEST=$(get_worker_ssh "$MACHINE")
+    local SSH_KEY
+    SSH_KEY=$(get_worker_ssh_key "$MACHINE")
+
+    local SSH_OPTS="-t"
+    [[ -n "$SSH_KEY" ]] && SSH_OPTS="-t -i $SSH_KEY"
+
+    tmux send-keys -t "$PANE" \
+        "ssh $SSH_OPTS $SSH_DEST 'export SOUL_AGENT_NAME=${AGENT} SOUL_TEAM_NAME=${TEAM_NAME} && claude --dangerously-skip-permissions --agent ${AGENT}'" \
+        Enter
+
+    # Wait for SSH + trust prompt
+    sleep 10
+    # Accept trust prompt
+    tmux send-keys -t "$PANE" Enter
+    # Wait for TUI
+    sleep 5
+    # Send boot prompt
+    local AGENT_BOOT="${BOOT} (You are ${AGENT}. Before your daily routine, check your inbox.)"
+    tmux send-keys -t "$PANE" "$AGENT_BOOT" Enter
+}
+
+# ── Background: staggered agent launch + daemon startup ──────────────────────
+(
+    sleep 3
+    for agent in "${SELECTED_AGENTS[@]}"; do
+        agent_pane="${PANE_MAP[$agent]}"
+        if [[ "${AGENT_MACHINE[$agent]}" == "primary" ]]; then
+            launch_local_agent "$agent_pane" "$agent"
+        else
+            launch_remote_agent "$agent_pane" "$agent"
+        fi
+        sleep "$DELAY"
+    done
+
+    echo ""
+    echo "  ${#SELECTED_AGENTS[@]} agents launched."
+
+    # ── Start soul-router (message router + discussion manager) ───────────────
+    echo "  Starting soul-router..."
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user start soul-router.service 2>/dev/null && \
+        echo "  Router: started via systemd." || \
+        echo "  Router: systemd not available — trying direct launch..."
+    if ! systemctl --user is-active soul-router.service >/dev/null 2>&1; then
+        router_bin="$SOUL_TEAM_DIR/soul-router.py"
+        if [ -f "$router_bin" ]; then
+            python3 "$router_bin" >> "$SOUL_TEAM_DIR/logs/soul-router.log" 2>&1 &
+            echo "  Router PID: $!"
+        else
+            echo "  Router: binary not found at $router_bin — skipping."
+        fi
+    fi
+
+    # ── Start soul-courier (message delivery daemon) ──────────────────────────
+    echo "  Starting soul-courier..."
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user start soul-courier.service 2>/dev/null && \
+        echo "  Courier: started via systemd." || \
+        echo "  Courier: systemd not available — trying direct launch..."
+    if ! systemctl --user is-active soul-courier.service >/dev/null 2>&1; then
+        courier_bin="$SOUL_TEAM_DIR/soul-courier.py"
+        if [ -f "$courier_bin" ]; then
+            python3 "$courier_bin" >> "$SOUL_TEAM_DIR/logs/soul-courier.log" 2>&1 &
+            echo "  Courier PID: $!"
+        else
+            echo "  Courier: binary not found at $courier_bin — skipping."
+        fi
+    fi
+
+    # ── Start heartbeat ───────────────────────────────────────────────────────
+    echo "  Starting soul-heartbeat..."
+    heartbeat_bin="$SOUL_TEAM_DIR/soul-heartbeat.sh"
+    if [ -f "$heartbeat_bin" ]; then
+        bash "$heartbeat_bin" >> "$SOUL_TEAM_DIR/logs/soul-heartbeat.log" 2>&1 &
+        echo "  Heartbeat PID: $!"
+    else
+        echo "  Heartbeat: binary not found at $heartbeat_bin — skipping."
+    fi
+
+    # ── Ensure guardian is running ────────────────────────────────────────────
+    echo "  Ensuring soul-guardian is running..."
+    systemctl --user start soul-guardian.service 2>/dev/null && \
+        echo "  Guardian: started/confirmed." || \
+        echo "  Guardian: could not start (not installed or not needed)."
+
+    echo "  ${TEAM_NAME} fully initialized."
+) &
+
+# ── Attach to the session ─────────────────────────────────────────────────────
+tmux attach-session -t "$SESSION"

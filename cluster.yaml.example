@@ -1,0 +1,84 @@
+# Soul Team — Cluster Configuration
+#
+# Defines machines, agents, and layout for the soul-team launcher.
+# Copy this file to cluster.yaml and customize for your setup.
+#
+# Modes:
+#   local:       All agents run on this machine
+#   distributed: Agents spread across multiple machines via SSH
+
+mode: distributed  # or "local"
+
+team:
+  name: soul-team
+  boot_prompt: "Run your daily routine then enter proactive mode when idle."
+  stagger_seconds: 10
+
+# Machine definitions
+machines:
+  primary:
+    host: localhost
+    role: control-plane  # runs courier, guardian, launcher
+    cgroup: true         # use systemd cgroup limits (Linux only)
+    cgroup_slice: soul-agents.slice
+    cpu_limit: "300%"    # 3 of 4 cores
+    mem_limit: 12G
+  worker:
+    host: 192.168.1.100  # change to your worker machine IP
+    user: your-username
+    role: worker
+    ssh_key: ~/.ssh/id_ed25519
+    cgroup: false
+
+# Agent definitions
+agents:
+  # Local agents (run on primary machine)
+  - name: assistant
+    model: sonnet
+    machine: primary
+    agent_file: agents/assistant.md
+
+  - name: developer
+    model: sonnet
+    machine: primary
+    agent_file: agents/developer.md
+
+  - name: researcher
+    model: opus
+    machine: primary
+    agent_file: agents/researcher.md
+
+  # Remote agents (run on worker machine via SSH)
+  # Uncomment these for distributed mode:
+  #
+  # - name: analyst
+  #   model: opus
+  #   machine: worker
+  #   agent_file: agents/analyst.md
+  #
+  # - name: builder
+  #   model: sonnet
+  #   machine: worker
+  #   agent_file: agents/builder.md
+
+# Tmux layout (auto-calculated if omitted)
+# layout:
+#   columns: 3  # CEO + 2 agent columns
+#   grid:
+#     - col: 1
+#       agents: [assistant, developer]
+#     - col: 2
+#       agents: [researcher]
+
+# Guardian settings
+guardian:
+  max_restarts_per_hour: 3
+  temp_limit_c: 80
+  mem_min_mb: 1500
+  cpu_warn_pct: 95
+
+# Courier settings
+courier:
+  reminder_interval_minutes: 30
+  ceo_notify_rate_limit_seconds: 600
+  backoff_max_seconds: 120

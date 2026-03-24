@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+soul-msg — CLI for multi-agent team coordination via ClawTeam.
+
+Part of the soul-team open-source multi-agent framework.
+Thin wrapper around clawteam CLI + native Teams inbox for the team lead.
+
+Configuration (environment variables):
+    SOUL_TEAM_NAME    — Team name (default: "soul-team")
+    SOUL_AGENT_NAME   — Your agent identity (default: "team-lead")
+    CLAWTEAM_BIN      — Path to clawteam binary (default: ~/.local/bin/clawteam)
+    CLAWTEAM_DATA_DIR — Path to clawteam data dir (default: ~/.clawteam)
+    SOUL_TEAM_CONFIG  — Path to native team config JSON (default: ~/.claude/teams/<team>/config.json)
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Config ──────────────────────────────────────────────────────────────────
+TEAM = os.environ.get("SOUL_TEAM_NAME", "soul-team")
+SENDER = os.environ.get("SOUL_AGENT_NAME", "team-lead")
+CLAWTEAM = os.environ.get("CLAWTEAM_BIN", str(Path.home() / ".local" / "bin" / "clawteam"))
+CLAWTEAM_DATA = Path(os.environ.get("CLAWTEAM_DATA_DIR", str(Path.home() / ".clawteam")))
+NATIVE_INBOX_DIR = Path.home() / ".claude" / "teams" / TEAM / "inboxes"
+NATIVE_INBOX_LEAD = NATIVE_INBOX_DIR / f"{SENDER}.json"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def run_clawteam(*args, capture=True):
+    """Run clawteam CLI and return (returncode, stdout, stderr)."""
+    cmd = [CLAWTEAM] + list(args)
+    result = subprocess.run(cmd, capture_output=capture, text=True)
+    return result.returncode, result.stdout, result.stderr
+
+
+def run_clawteam_json(*args):
+    """Run clawteam with --json flag, return parsed dict/list or None."""
+    cmd = [CLAWTEAM, "--json"] + list(args)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None, result.stderr
+    try:
+        return json.loads(result.stdout), None
+    except json.JSONDecodeError:
+        return None, f"JSON parse error: {result.stdout[:200]}"
+
+
+def append_native_inbox(from_agent, text):
+    """Append message to native team-lead inbox JSON file."""
+    NATIVE_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    msgs = []
+    if NATIVE_INBOX_LEAD.exists():
+        try:
+            msgs = json.loads(NATIVE_INBOX_LEAD.read_text())
+        except (json.JSONDecodeError, IOError):
+            msgs = []
+    msgs.append({
+        "from": from_agent,
+        "text": text,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "read": False,
+    })
+    NATIVE_INBOX_LEAD.write_text(json.dumps(msgs, indent=2))
+
+
+def priority_tag(priority):
+    """Convert P1/P2/P3 to routing key string."""
+    return {"P1": "urgent", "P2": "normal", "P3": "low"}.get(priority, "normal")
+
+
+def _get_team_config_path():
+    """Return the path to the native team config JSON."""
+    env_path = os.environ.get("SOUL_TEAM_CONFIG")
+    if env_path:
+        return Path(env_path)
+    return Path.home() / ".claude" / "teams" / TEAM / "config.json"
+
+
+# ── Subcommands ──────────────────────────────────────────────────────────────
+
+def cmd_send(args):
+    recipient = args.recipient
+    message = args.message
+    priority = args.priority or "P2"
+    key = priority_tag(priority)
+
+    rc, out, err = run_clawteam(
+        "inbox", "send", TEAM, recipient, message,
+        "--from", SENDER,
+        "--key", key,
+    )
+    if rc != 0:
+        print(f"ERROR: clawteam send failed: {err.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    print(out.strip() if out.strip() else f"Sent to {recipient} [{priority}]")
+
+    # Mirror to native inbox if sending to self (team-lead)
+    if recipient == SENDER:
+        append_native_inbox(SENDER, message)
+        print(f"  (mirrored to native {SENDER} inbox)")
+
+
+def cmd_inbox(args):
+    flags = ["inbox", "peek", TEAM, "--agent", SENDER]
+    data, err = run_clawteam_json(*flags)
+
+    if err or data is None:
+        # Fall back to native inbox for team-lead
+        if NATIVE_INBOX_LEAD.exists():
+            try:
+                msgs = json.loads(NATIVE_INBOX_LEAD.read_text())
+            except (json.JSONDecodeError, IOError):
+                msgs = []
+            _print_inbox(msgs, args)
+            return
+        print(f"ERROR reading inbox: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    # data may be a list of message objects
+    msgs = data if isinstance(data, list) else data.get("messages", [])
+    _print_inbox(msgs, args)
+
+
+def _print_inbox(msgs, args):
+    if args.from_agent:
+        msgs = [m for m in msgs if m.get("from") == args.from_agent]
+    if args.unread:
+        msgs = [m for m in msgs if not m.get("read", False)]
+
+    if not msgs:
+        print("Inbox empty.")
+        return
+
+    print(f"{'#':<4} {'FROM':<12} {'PRIORITY':<10} {'TIME':<22} MESSAGE")
+    print("-" * 80)
+    for i, m in enumerate(msgs, 1):
+        ts = m.get("timestamp", "")[:19].replace("T", " ")
+        key = m.get("key", "normal")
+        pri = {"urgent": "P1", "normal": "P2", "low": "P3"}.get(key, key)
+        read_mark = " " if m.get("read") else "*"
+        text = m.get("text", m.get("content", ""))
+        short = text[:40] + ("..." if len(text) > 40 else "")
+        print(f"{read_mark}{i:<3} {m.get('from', '?'):<12} {pri:<10} {ts:<22} {short}")
+
+
+def cmd_broadcast(args):
+    rc, out, err = run_clawteam(
+        "inbox", "broadcast", TEAM, args.message,
+    )
+    if rc != 0:
+        print(f"ERROR: broadcast failed: {err.strip()}", file=sys.stderr)
+        sys.exit(1)
+    print(out.strip() if out.strip() else "Broadcast sent to all agents.")
+
+
+def cmd_status(args):
+    data, err = run_clawteam_json("team", "status", TEAM)
+    if err or data is None:
+        print(f"ERROR reading team status: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    _print_status(data)
+
+
+def _print_status(cfg):
+    members = cfg.get("members", [])
+    lead_id = cfg.get("leadAgentId", "?")
+    print(f"Team:  {cfg.get('name', TEAM)}")
+    print(f"Lead:  {lead_id}")
+    print(f"Members ({len(members)}):")
+    print(f"  {'NAME':<14} {'TYPE':<10} {'AGENT_ID':<16} JOINED")
+    print("  " + "-" * 65)
+    for m in members:
+        name = m.get("name", "?")
+        atype = m.get("agentType", "?")
+        aid = m.get("agentId", "?")[:12]
+        joined = m.get("joinedAt", "")[:10]
+        leader_mark = " (lead)" if m.get("agentId") == lead_id else ""
+        print(f"  {name:<14} {atype:<10} {aid:<16} {joined}{leader_mark}")
+
+    # Also show tmux pane info from native config if available
+    native_cfg_path = _get_team_config_path()
+    if native_cfg_path.exists():
+        try:
+            native = json.loads(native_cfg_path.read_text())
+            pane_map = {m.get("name"): m.get("tmuxPaneId", "") for m in native.get("members", [])}
+            active_panes = [(n, p) for n, p in pane_map.items() if p]
+            if active_panes:
+                print(f"\nTmux panes registered ({len(active_panes)}):")
+                for name, pane in sorted(active_panes):
+                    print(f"  {name:<14} {pane}")
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Heartbeat
+    hb_dir = CLAWTEAM_DATA / "teams" / TEAM / "heartbeat"
+    if hb_dir.exists():
+        hb_files = list(hb_dir.glob("*.json"))
+        print(f"\nHeartbeats: {len(hb_files)} file(s)")
+        for hf in sorted(hb_files)[:10]:
+            try:
+                hb = json.loads(hf.read_text())
+                ts = hb.get("timestamp", "")[:19].replace("T", " ")
+                agent = hb.get("agent", hf.stem)
+                print(f"  {agent:<14} last seen {ts}")
+            except (json.JSONDecodeError, IOError):
+                pass
+    else:
+        print("\nHeartbeats: none")
+
+
+def cmd_peek(args):
+    agent = args.agent
+    # Look up pane from native config (has tmux pane IDs)
+    config_path = _get_team_config_path()
+    pane_id = None
+    if config_path.exists():
+        cfg = json.loads(config_path.read_text())
+        for m in cfg.get("members", []):
+            if m.get("name") == agent:
+                pane_id = m.get("tmuxPaneId", "")
+                break
+
+    if not pane_id:
+        print(f"No active tmux pane for {agent} (agent not running or pane not registered).")
+        return
+
+    lines = args.lines if hasattr(args, "lines") and args.lines else 30
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", f"-{lines}"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"tmux capture failed for pane {pane_id}: {result.stderr.strip()}")
+        return
+    output = result.stdout.rstrip()
+    if not output:
+        print(f"(pane {pane_id} is empty)")
+    else:
+        print(f"--- {agent} (pane {pane_id}) last {lines} lines ---")
+        print(output)
+
+
+def cmd_history(args):
+    flags = ["inbox", "log", TEAM]
+    if args.agent:
+        flags += ["--agent", args.agent]
+    flags += ["--limit", "20"]
+
+    rc, out, err = run_clawteam(*flags)
+    if rc != 0:
+        print(f"ERROR reading history: {err.strip()}", file=sys.stderr)
+        sys.exit(1)
+    print(out.strip() if out.strip() else "No history found.")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="soul-msg",
+        description="CLI for soul-team multi-agent coordination",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # send
+    p_send = sub.add_parser("send", help="Send message to an agent")
+    p_send.add_argument("recipient", help="Agent name")
+    p_send.add_argument("message", help="Message text")
+    p_send.add_argument("--priority", choices=["P1", "P2", "P3"], default="P2")
+
+    # inbox
+    p_inbox = sub.add_parser("inbox", help="View your inbox")
+    p_inbox.add_argument("--unread", action="store_true")
+    p_inbox.add_argument("--from", dest="from_agent", metavar="AGENT")
+
+    # broadcast
+    p_bc = sub.add_parser("broadcast", help="Send to all agents")
+    p_bc.add_argument("message", help="Broadcast message")
+
+    # status
+    sub.add_parser("status", help="Show team status + heartbeats")
+
+    # peek
+    p_peek = sub.add_parser("peek", help="Capture tmux pane of an agent")
+    p_peek.add_argument("agent", help="Agent name")
+    p_peek.add_argument("--lines", type=int, default=30)
+
+    # history
+    p_hist = sub.add_parser("history", help="View message history")
+    p_hist.add_argument("--agent", help="Filter by agent name")
+
+    args = parser.parse_args()
+
+    dispatch = {
+        "send": cmd_send,
+        "inbox": cmd_inbox,
+        "broadcast": cmd_broadcast,
+        "status": cmd_status,
+        "peek": cmd_peek,
+        "history": cmd_history,
+    }
+    dispatch[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
