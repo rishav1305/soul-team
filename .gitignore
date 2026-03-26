@@ -68,3 +68,73 @@ npm-debug.log*
 # Guardian cache
 guardian_state.json
 agent_snapshots/
+
+# Always track example configs
+!examples/
+!examples/**
+
+# ============================================
+# OPERATIONAL DATA — NEVER PUBLISH
+# Reviewed by Pepper (CPO) + Fury (Strategy)
+# ============================================
+
+# PII — Resumes and cover letters
+*.pdf
+*resume*
+*coverletter*
+*cover-letter*
+
+# Compensation and salary data
+*comp-research*
+*comp-floor*
+*salary*
+*rate-anchoring*
+*contract-product-packaging*
+
+# Outreach emails and lead pipeline
+*outreach*
+*t3-triage*
+*t3-audit*
+*t2-audit*
+*approved-leads*
+*closed-lead*
+*pipeline-queue*
+*warm-target*
+
+# Trading strategies (alpha is the moat)
+stark-trades.md
+stark-strategy-document.md
+stark-sentiment-daily.md
+*war-regime*
+*vix-mean-reversion*
+
+# Internal strategic decisions
+shared/decisions/
+shared/standups/
+shared/inbox/
+shared/.conference-state/
+
+# Internal strategy docs
+*career-trajectory*
+*reveal-strategy*
+*contract-pivot*
+*joint-brief*
+*delegated-decisions*
+*pre-outreach-readiness*
+*90day-master-plan*
+
+# Product internals
+pepper-product-registry.md
+pepper-roadmap.md
+*workload-assessment*
+*action-queue*
+
+# Interview prep (company-specific)
+*askeffi-prep*
+*company-prep*
+*toptal-sprint*
+*turing-delta*
+
+# Week-ahead / daily ops
+*week-ahead*
+*ceo-action*

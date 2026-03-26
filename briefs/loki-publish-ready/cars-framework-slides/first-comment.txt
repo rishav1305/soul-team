@@ -1,0 +1,7 @@
+Full methodology, all 8 benchmark charts, and model-by-model results at rishavchatterjee.com/blog/cars-benchmark
+
+The framework is open-source: github.com/rishav1305/soul-bench
+
+What model are you running in production? Curious what others are seeing in real workloads.
+
+— Rishav Chatterjee

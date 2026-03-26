@@ -1,0 +1,55 @@
+AI agents are overhyped.
+
+But not for the reasons you think.
+
+The skeptics say "agents aren't smart enough."
+Wrong. LLMs are plenty smart for most tasks.
+
+The real problem?
+Nobody's solving coordination.
+
+I built 9 specialized agents.
+The hardest part wasn't making any single agent smart.
+It was building the system that lets them:
+
+- Share work without duplicating effort
+- Resolve conflicts without human intervention
+- Route tasks to the right specialist
+- Escalate intelligently when they're stuck
+
+That's not an AI problem.
+That's a distributed systems problem.
+
+The industry treats this like a model problem.
+"If we just make the LLM smarter, agents will work."
+They won't. The coordination layer is missing.
+
+Here's what the market data says:
+
+Industry analysts: 1,445% surge in multi-agent inquiries.
+40% of enterprise apps will embed AI agents by end of 2026.
+Enterprise multi-agent systems are six-figure builds.
+
+The demand is real. The supply isn't.
+
+Even LinkedIn built their multi-agent coordination
+on existing messaging infrastructure (InfoQ, Sept 2025).
+Not a new framework. Not a new protocol.
+A messaging pattern that handles async coordination.
+
+Because what's scarce isn't better models.
+It's architects who can design the coordination layer --
+the inbox protocols, the conference mechanisms,
+the skill-sharing systems, the escalation chains.
+
+The LLM is 10% of the problem.
+The coordination layer is the other 90%.
+
+The teams that win won't be the ones with the smartest agents.
+They'll be the ones that treat agents like distributed systems,
+not chatbots with extra steps.
+
+What's the biggest coordination challenge you've faced
+with multi-agent systems?
+
+#AI #AIAgents #LLM #DistributedSystems #TechLeadership

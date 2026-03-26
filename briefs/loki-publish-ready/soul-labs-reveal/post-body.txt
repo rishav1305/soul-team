@@ -1,0 +1,49 @@
+I didn't start a company. I started a lab.
+
+The distinction matters more than most people think.
+
+Over the past year, I published two things:
+
+1. CARS -- a benchmark that scored 52 AI models across 7 providers. Found a 140x efficiency gap between the best and worst. GPT-5 scored lower than GPT-3.5 Turbo on structured tasks.
+
+2. SoulGraph -- an open-source coordination layer for multi-agent systems. 9 specialized agents. Distributed hardware. Battle-tested daily.
+
+Both came from one observation: enterprise AI stalls at the coordination layer. And nobody measures the right things to fix it.
+
+I could have packaged this as consulting.
+I could have called it a startup.
+I could have stayed "independent."
+
+I chose lab. Here's why:
+
+A consultancy sells hours. Your rate becomes your ceiling.
+A startup sells a product. Your runway becomes your constraint.
+An agency sells deliverables. Your headcount becomes your identity.
+
+A lab produces research that changes how others build.
+
+Today I'm making the frame official.
+
+Soul Labs is an applied AI research lab focused on multi-agent orchestration and efficiency-aware model evaluation.
+
+What we publish:
+- CARS methodology (evaluating models for production, not leaderboards)
+- SoulGraph coordination patterns (inbox protocols, conference mechanisms, skill sharing)
+- Enterprise frameworks for the "pilot to production" gap
+
+What we build:
+- Production AI systems at Fortune 500 scale (5,000+ daily users, 88% resolution rate)
+- Evaluation infrastructure that tests what actually matters in deployment
+- Coordination layers for the 90% of the problem nobody's solving
+
+The research was already public. The lab makes it permanent.
+
+This isn't an announcement about funding rounds or founding teams. It's a container for work that's been done -- and a commitment to the work ahead.
+
+If you're an engineer doing research without a university title or a VC deck, you know the tension. The work exists. The frame didn't.
+
+Now it does.
+
+What frame works for your independent technical work -- lab, studio, consultancy, or something else?
+
+#AI #AIResearch #MultiAgent #LLMEvaluation #AIArchitecture

@@ -1,0 +1,8 @@
+The coordination layer is SoulGraph — open source on GitHub.
+
+LangGraph for orchestration, ChromaDB for semantic memory, Redis state bus coming in Phase 2.
+
+Full architecture details at rishavchatterjee.com
+github.com/rishav1305/soulgraph
+
+— Rishav Chatterjee

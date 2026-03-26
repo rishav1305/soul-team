@@ -1,0 +1,5 @@
+Full benchmark methodology, all 8 charts, and model-by-model results in the deep-dive article. Follow for the drop.
+
+Which model is your production default? Curious what others are seeing.
+
+— Rishav Chatterjee

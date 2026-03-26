@@ -1,0 +1,23 @@
+I manage 9 AI agents across 2 machines. Daily.
+
+Not hypothetical. Not a weekend project.
+A production coordination system running since March 2026.
+
+This carousel breaks down HOW they work together
+without chaos, conflicts, or priority deadlocks.
+
+3 patterns that make it possible:
+
+1. Inbox Protocol — structured messaging between agents
+2. Conference Protocol — multi-agent decision-making
+3. Skill Sharing — capabilities that cross agent boundaries
+
+Each agent owns a domain: operations, pipeline, data science,
+engineering, strategy, brand, finance, interviews, product.
+
+The LLM is 10% of the problem.
+The coordination layer is the other 90%.
+
+Swipe through for the architecture.
+
+#AI #AIAgents #MultiAgent #DistributedSystems #AIArchitecture

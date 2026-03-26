@@ -1,0 +1,76 @@
+GPT-5 scores lower than GPT-3.5 Turbo.
+
+That's not a typo. We tested it.
+
+I ran 52 AI models through 30 structured tasks across 10 categories. Not vibes. Not "it feels better." Actual scored outputs with strict format matching.
+
+The results broke every assumption I had about model selection.
+
+Here's what the data says:
+
+---
+
+THE REGRESSION PROBLEM
+
+GPT-5 scored 56.7% strict. GPT-3.5 Turbo scored 75.7%.
+
+That's a 19-point regression across two model generations.
+
+It gets worse:
+- GPT-5-nano (43.3%) vs GPT-4.1-nano (67.0%) = 24pp gap
+- Gemini 2.5 Pro (33.9%) vs Gemini 2.0 Flash (66.3%) = 32pp gap
+- Claude 3.7 Sonnet (33.9%) vs Claude 3.5 Sonnet (71.2%) = 37pp gap
+
+Newer models are getting WORSE at following structured output instructions. Not because they're dumber. Because they think too much.
+
+---
+
+THE FORMAT TAX
+
+I measure two scores: "strict" (exact format match) and "relaxed" (right answer, any format).
+
+The gap between them reveals a hidden cost I call the Format Tax.
+
+Some models lose 0 points. o3 returns exactly what you ask for, every time.
+
+Others lose up to 27 points. Claude Opus 4.5 and Gemini 3 Pro know the answer but wrap it in markdown, labels, and explanations you never asked for.
+
+Average format tax across 52 models: 14 percentage points.
+
+That's not a model quality issue. It's an instruction-following issue. And most benchmarks don't even measure it.
+
+---
+
+THE EFFICIENCY SURPRISE
+
+The most cost-efficient model in the benchmark?
+
+Not GPT-4o. Not Claude Sonnet. Not Gemini.
+
+It's Amazon Nova Micro. 3 billion parameters. 1.42 seconds latency. 79% accuracy. 3.5x more efficient than the next best model.
+
+Second place: a 20B open-source model on AWS Bedrock that beat GPT-4o on accuracy while costing a fraction of the price.
+
+---
+
+WHAT THIS MEANS FOR PRODUCTION
+
+If you're building production AI systems:
+
+1. Pin your model versions. Upgrades can break pipelines.
+2. Turn off reasoning for structured tasks. Gemini models score 2x worse with reasoning enabled.
+3. Test strict AND relaxed. A model at 65% strict / 92% relaxed isn't bad. It needs a parser.
+4. Small models dominate efficiency. Nova Micro at 3B outperforms models 100x its size per dollar.
+5. Don't trust the marketing. Test against YOUR tasks with YOUR scoring.
+
+The methodology behind this is CARS (Cost-Adjusted Relative Score). It factors in accuracy, format compliance, latency, and model size into a single efficiency metric.
+
+This matters because agent systems are replacing headcount right now. Block's internal AI agent drove 40% productivity gains — and 40% layoffs followed. Companies building with agents need to know which models to put inside them.
+
+52 models. 7 providers. 30 tasks. The data doesn't lie.
+
+---
+
+Full benchmark methodology and data in the deep-dive article coming soon.
+
+#LLMEvaluation #AIEngineering #MachineLearning #ProductionAI #Benchmarking

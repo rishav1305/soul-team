@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1080">
+  <title>Carousel</title>
+  <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 1080px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.slide {
+  width: 1080px;
+  height: 1350px;
+  background: linear-gradient(160deg, #1a1a2e 0%, #16213e 100%);
+  padding: 100px 80px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  page-break-after: always;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Corner accent */
+.slide::before {
+  content: '';
+  position: absolute;
+  top: 0; right: 0;
+  width: 200px; height: 200px;
+  background: radial-gradient(circle at top right, rgba(232,168,73,0.08), transparent 70%);
+  pointer-events: none;
+}
+
+.slide:last-child { page-break-after: avoid; }
+
+/* Shared text styles */
+.headline {
+  font-size: 52px;
+  font-weight: 700;
+  color: #e8a849;
+  line-height: 1.15;
+  letter-spacing: -0.5px;
+  margin-bottom: 20px;
+}
+
+.subheadline {
+  font-size: 30px;
+  font-weight: 500;
+  color: #f0f0f0;
+  line-height: 1.4;
+  margin-bottom: 32px;
+}
+
+.body-text {
+  font-size: 30px;
+  font-weight: 400;
+  color: #f0f0f0;
+  line-height: 1.55;
+}
+
+.accent-text {
+  font-size: 30px;
+  font-weight: 500;
+  color: #e8a849;
+  line-height: 1.5;
+}
+
+.gray-text {
+  font-size: 28px;
+  color: #a0a0b0;
+  line-height: 1.5;
+}
+
+.footer {
+  font-size: 22px;
+  color: #a0a0b0;
+  margin-top: auto;
+  padding-top: 24px;
+}
+
+.gold-divider {
+  width: 80px;
+  height: 4px;
+  background: #e8a849;
+  border-radius: 2px;
+  margin: 28px 0;
+}
+
+/* ── Title layout ─────────────────────────────────────────────────── */
+.layout-title {
+  justify-content: center;
+  text-align: left;
+}
+.layout-title .headline {
+  font-size: 60px;
+  line-height: 1.1;
+}
+.layout-title .subheadline {
+  font-size: 32px;
+  color: #f0f0f0;
+  margin-bottom: 0;
+}
+
+/* ── Bullets layout ───────────────────────────────────────────────── */
+.layout-bullets .content-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 18px;
+}
+
+.bullet-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  font-size: 29px;
+  color: #f0f0f0;
+  line-height: 1.5;
+}
+
+.bullet-icon {
+  color: #e8a849;
+  font-size: 26px;
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+/* ── Two-column layout ────────────────────────────────────────────── */
+.layout-two-col .col-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 40px;
+  flex: 1;
+}
+
+.col-heading {
+  font-size: 26px;
+  font-weight: 700;
+  color: #e8a849;
+  margin-bottom: 16px;
+  letter-spacing: 0.3px;
+}
+
+.col-item {
+  font-size: 25px;
+  color: #f0f0f0;
+  line-height: 1.6;
+  padding: 6px 0;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.col-item::before {
+  content: '▸';
+  color: #e8a849;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.col-footer-note {
+  font-size: 26px;
+  font-style: italic;
+  color: #a0a0b0;
+  text-align: center;
+  margin-top: auto;
+  padding-top: 20px;
+  border-top: 1px solid rgba(232,168,73,0.25);
+}
+
+/* ── Stats/numbers layout ─────────────────────────────────────────── */
+.layout-stats .stats-list {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  flex: 1;
+}
+
+.stat-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 24px;
+}
+
+.stat-number {
+  font-size: 72px;
+  font-weight: 700;
+  color: #e8a849;
+  line-height: 1;
+  flex-shrink: 0;
+  min-width: 80px;
+}
+
+.stat-label {
+  font-size: 28px;
+  color: #f0f0f0;
+  line-height: 1.5;
+  padding-top: 16px;
+}
+
+/* ── Comparison layout ────────────────────────────────────────────── */
+.layout-comparison .cmp-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  flex: 1;
+  align-items: start;
+}
+
+.cmp-col {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(232,168,73,0.2);
+  border-radius: 12px;
+  padding: 28px 24px;
+}
+
+.cmp-col.highlighted {
+  background: rgba(232,168,73,0.08);
+  border-color: rgba(232,168,73,0.5);
+}
+
+.cmp-heading {
+  font-size: 26px;
+  font-weight: 700;
+  color: #e8a849;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(232,168,73,0.3);
+}
+
+.cmp-item {
+  font-size: 26px;
+  color: #f0f0f0;
+  line-height: 1.6;
+  padding: 6px 0;
+}
+
+/* ── Callout box ──────────────────────────────────────────────────── */
+.callout {
+  background: rgba(232,168,73,0.07);
+  border: 1px solid rgba(232,168,73,0.35);
+  border-left: 4px solid #e8a849;
+  border-radius: 8px;
+  padding: 24px 28px;
+  margin-top: 24px;
+  font-size: 26px;
+  color: #f0f0f0;
+  line-height: 1.6;
+  font-style: italic;
+}
+
+/* ── Visual chain / escalation ────────────────────────────────────── */
+.layout-chain .chain-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex: 1;
+}
+
+.chain-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+  padding: 18px 0;
+}
+
+.chain-num {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: #e8a849;
+  color: #1a1a2e;
+  font-weight: 700;
+  font-size: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.chain-content .chain-title {
+  font-size: 26px;
+  font-weight: 700;
+  color: #e8a849;
+  margin-bottom: 4px;
+}
+
+.chain-content .chain-desc {
+  font-size: 24px;
+  color: #a0a0b0;
+  line-height: 1.5;
+}
+
+.chain-arrow {
+  color: #e8a849;
+  font-size: 22px;
+  margin-left: 14px;
+  opacity: 0.5;
+  padding: 2px 0;
+}
+
+/* ── Two-box layout ───────────────────────────────────────────────── */
+.layout-two-box .boxes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  flex: 1;
+  align-items: start;
+}
+
+.box {
+  border: 1.5px solid rgba(232,168,73,0.4);
+  border-radius: 14px;
+  padding: 32px 28px;
+}
+
+.box.filled {
+  background: rgba(232,168,73,0.12);
+  border-color: #e8a849;
+}
+
+.box-title {
+  font-size: 26px;
+  font-weight: 700;
+  color: #e8a849;
+  margin-bottom: 12px;
+}
+
+.box-subtitle {
+  font-size: 22px;
+  color: #a0a0b0;
+  margin-bottom: 14px;
+  font-style: italic;
+}
+
+.box-body {
+  font-size: 24px;
+  color: #f0f0f0;
+  line-height: 1.6;
+}
+
+.connector {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  color: #a0a0b0;
+  text-align: center;
+  margin-top: auto;
+  padding-top: 16px;
+}
+
+/* ── CTA layout ───────────────────────────────────────────────────── */
+.layout-cta {
+  justify-content: center;
+  align-items: flex-start;
+  gap: 0;
+}
+
+.cta-main {
+  font-size: 58px;
+  font-weight: 700;
+  color: #e8a849;
+  line-height: 1.15;
+  margin-bottom: 28px;
+}
+
+.cta-body {
+  font-size: 30px;
+  color: #f0f0f0;
+  line-height: 1.6;
+  margin-bottom: 32px;
+}
+
+.cta-action {
+  font-size: 28px;
+  font-weight: 500;
+  color: #e8a849;
+  margin-top: 16px;
+}
+
+/* ── Big stat highlight ───────────────────────────────────────────── */
+.big-stat {
+  font-size: 96px;
+  font-weight: 700;
+  color: #e8a849;
+  line-height: 1;
+  margin: 16px 0 8px;
+}
+
+.big-stat-label {
+  font-size: 28px;
+  color: #a0a0b0;
+  margin-bottom: 24px;
+}
+</style>
+</head>
+<body>
+
+    <div class="slide layout-title">
+      <div>
+        <div class="headline">How 9 AI Agents Coordinate Without Chaos</div>
+        <div class="gold-divider"></div>
+        <div class="subheadline">Three patterns from building a production multi-agent system</div>
+      </div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-two-col">
+      <div class="headline">9 Specialized Agents, 2 Machines</div>
+      <div class="col-container">
+        <div>
+          <div class="col-heading">Always-On Machine (6 agents)</div>
+          <div class="col-item">Operations — scheduling, tasks, coordination</div><div class="col-item">Strategy — market analysis, competitive intel</div><div class="col-item">Content — brand, content pipeline, SEO</div><div class="col-item">Knowledge — coaching, assessment, adaptive learning</div><div class="col-item">Product — roadmaps, prioritization, gap analysis</div><div class="col-item">Pipeline — lead research, outreach, funnel</div>
+        </div>
+        <div>
+          <div class="col-heading">High-Compute Machine (3 agents)</div>
+          <div class="col-item">Technical — code architecture, builds, sprints</div><div class="col-item">Data Science — EDA, ML, visualization</div><div class="col-item">Analytics — research, quantitative analysis</div>
+        </div>
+      </div>
+      <div class="col-footer-note">Each agent has a role. The SYSTEM makes them collaborate.</div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-stats">
+      <div class="headline">Why Multi-Agent Systems Fail</div>
+      
+      <div class="stats-list">
+        
+          <div class="stat-item">
+            <div class="stat-number">1</div>
+            <div class="stat-label">Shared state conflicts — 2 agents edit the same thing</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number">2</div>
+            <div class="stat-label">Contradictory decisions — agents give conflicting advice</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number">3</div>
+            <div class="stat-label">Priority deadlocks — everyone waits for everyone else</div>
+          </div>
+        <div class="callout">Enterprise equivalent: 9 developers with no git, no Jira, and no standup.</div>
+      </div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-bullets">
+      <div class="headline">Pattern 1: Inbox Protocol</div>
+      <div class="subheadline">Async messaging without shared state</div>
+      <div class="content-area">
+        
+          <div class="bullet-item">
+            <span class="bullet-icon">◆</span>
+            <span>Each agent has a persistent inbox</span>
+          </div>
+          <div class="bullet-item">
+            <span class="bullet-icon">◆</span>
+            <span>Messages are files: briefs, requests, corrections</span>
+          </div>
+          <div class="bullet-item">
+            <span class="bullet-icon">◆</span>
+            <span>Agents process on their own schedule</span>
+          </div>
+          <div class="bullet-item">
+            <span class="bullet-icon">◆</span>
+            <span>No race conditions, full audit trail</span>
+          </div>
+        <div class="callout">LinkedIn built their multi-agent coordination on existing messaging infrastructure. — InfoQ, Sept 2025</div>
+      </div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-chain">
+      <div class="headline">Pattern 2: Conference Protocol</div>
+      <div class="chain-list">
+        
+          <div>
+            <div class="chain-step">
+              <div class="chain-num">1</div>
+              <div class="chain-content">
+                <div class="chain-title">Decision needed</div>
+                <div class="chain-desc">Any agent can convene a conference</div>
+              </div>
+            </div>
+            <div class="chain-arrow" style="margin-left:14px;">↓</div>
+          </div>
+          <div>
+            <div class="chain-step">
+              <div class="chain-num">2</div>
+              <div class="chain-content">
+                <div class="chain-title">2–5 agents convened</div>
+                <div class="chain-desc">Each contributes domain expertise</div>
+              </div>
+            </div>
+            <div class="chain-arrow" style="margin-left:14px;">↓</div>
+          </div>
+          <div>
+            <div class="chain-step">
+              <div class="chain-num">3</div>
+              <div class="chain-content">
+                <div class="chain-title">Consensus document</div>
+                <div class="chain-desc">Action items, aligned direction</div>
+              </div>
+            </div>
+            
+          </div>
+        <div class="callout">&quot;Should we reposition the brand?&quot; → Strategy + Content + Technical aligned in minutes, not weeks.</div>
+      </div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-comparison">
+      <div class="headline">Pattern 3: Skill Sharing</div>
+      
+    <div style="text-align:center; margin-bottom: 20px;">
+      <div class="big-stat">65+</div>
+      <div class="big-stat-label">shared skills across all 9 agents</div>
+    </div>
+      <div class="cmp-container">
+        <div class="cmp-col">
+          <div class="cmp-heading">Skills are ABILITIES</div>
+          <div class="cmp-item">&quot;How to audit SEO&quot;</div><div class="cmp-item">&quot;How to run analysis&quot;</div><div class="cmp-item">&quot;How to debug a build&quot;</div>
+        </div>
+        <div class="cmp-col">
+          <div class="cmp-heading">Not DATA</div>
+          <div class="cmp-item">&quot;Last audit results&quot;</div><div class="cmp-item">&quot;Latest output&quot;</div><div class="cmp-item">&quot;Previous fix&quot;</div>
+        </div>
+      </div>
+      <div class="col-footer-note">Any agent invokes any skill (access scoped by role). Prevents silos. Accelerates cross-domain work.</div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-two-box">
+      <div class="headline">Route Tasks to the Right Hardware</div>
+      <div class="boxes">
+        <div class="box">
+          <div class="box-title">Machine 1: Always-On</div>
+          <div class="box-subtitle">Light compute, continuous availability</div>
+          <div class="box-body">6 agents: coordination, strategy, content, ops</div>
+        </div>
+        <div class="box filled">
+          <div class="box-title">Machine 2: High-Compute</div>
+          <div class="box-subtitle">Heavy CPU/memory, on-demand</div>
+          <div class="box-body">3 agents: code, data science, analytics</div>
+        </div>
+      </div>
+      <div class="connector">SSH + shared filesystem — heavy tasks route automatically</div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-chain">
+      <div class="headline">What Happens When Agents Disagree</div>
+      <div class="chain-list">
+        
+          <div>
+            <div class="chain-step">
+              <div class="chain-num">1</div>
+              <div class="chain-content">
+                <div class="chain-title">Self-solve</div>
+                <div class="chain-desc">Check skills, knowledge sources, web search</div>
+              </div>
+            </div>
+            <div class="chain-arrow" style="margin-left:14px;">↓</div>
+          </div>
+          <div>
+            <div class="chain-step">
+              <div class="chain-num">2</div>
+              <div class="chain-content">
+                <div class="chain-title">Peer route</div>
+                <div class="chain-desc">Send to specialist's inbox, continue other work</div>
+              </div>
+            </div>
+            <div class="chain-arrow" style="margin-left:14px;">↓</div>
+          </div>
+          <div>
+            <div class="chain-step">
+              <div class="chain-num">3</div>
+              <div class="chain-content">
+                <div class="chain-title">Human escalate</div>
+                <div class="chain-desc">Full context: what tried, what needed, what failed</div>
+              </div>
+            </div>
+            
+          </div>
+        <div class="callout">The escalation chain IS the product. Without it: deadlocks or silent bad decisions.</div>
+      </div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-bullets">
+      <div class="headline">What Changes When Coordination Works</div>
+      
+      <div class="content-area">
+        
+          <div class="bullet-item">
+            <span class="bullet-icon">◆</span>
+            <span>Autonomous task execution — agents pick, execute, verify, merge</span>
+          </div>
+          <div class="bullet-item">
+            <span class="bullet-icon">◆</span>
+            <span>Cross-domain insights — strategy connects content + pipeline + market data</span>
+          </div>
+          <div class="bullet-item">
+            <span class="bullet-icon">◆</span>
+            <span>Continuous operation — daily routines run autonomously</span>
+          </div>
+        <div class="callout">The LLM is 10% of the problem. Coordination is 90%.</div>
+      </div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect</div>
+    </div>
+
+    <div class="slide layout-cta">
+      <div>
+        <div class="cta-main">Stop Thinking About Agents. Start Thinking About Systems.</div>
+        <div class="gold-divider"></div>
+        <div class="cta-body">The market wants agents.
+What it needs is architects who understand coordination.</div>
+        <div class="cta-action">→ Follow for more on production AI systems.</div>
+      </div>
+      <div class="footer">Rishav Chatterjee | Senior AI Architect | rishavchatterjee.com</div>
+    </div>
+</body>
+</html>
