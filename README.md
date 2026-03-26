@@ -1,53 +1,92 @@
 # soul-team
 
-**Run a team of Claude AI agents across multiple machines.**
+**Run a team of AI agents. Assign roles, coordinate work, ship together.**
 
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white)
-![License MIT](https://img.shields.io/badge/License-MIT-green)
+![Claude Code](https://img.shields.io/badge/Claude_Code-Runtime-blueviolet?logo=anthropic&logoColor=white)
 ![tmux 3.2+](https://img.shields.io/badge/tmux-3.2%2B-orange)
+![License MIT](https://img.shields.io/badge/License-MIT-green)
 
-soul-team is an open-source framework for running distributed teams of Claude AI agents using tmux. Each agent lives in its own pane, communicates with teammates via a structured message bus, and is managed by daemons that handle delivery, health monitoring, and resource enforcement — all configured from a single YAML file.
+soul-team is a **multi-agent runtime for Claude Code**. It turns a single Claude Code session into a coordinated team of specialized AI agents — each in its own tmux pane, communicating via a structured message bus, monitored by daemons that handle delivery, health, crash recovery, and resource enforcement. One YAML file. Multiple machines. Production-grade.
+
+<!-- TODO: Add hero screenshot of 10-pane tmux session here -->
+<!-- ![soul-team running](docs/images/hero.png) -->
+
+---
+
+## Why soul-team?
+
+Agent configurations are easy. Making agents **survive crashes**, **share resources**, and **communicate across machines** is the hard problem.
+
+Most multi-agent setups give you orchestration for a single machine. soul-team solves the operational layer:
+
+- **Courier** — async message routing between agents (not just parallel execution)
+- **Guardian** — crash recovery, thermal protection, cgroup resource limits
+- **ClawTeam** — structured inbox, broadcast, task management across the team
+- **Distributed** — agents span multiple machines over SSH, coordinated from one session
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────── primary machine ──────────────────────┐
-│  tmux session "soul-team"                                 │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐    │
-│  │CEO pane │  │agent-1  │  │agent-2  │  │agent-3  │    │
-│  │(you)    │  │(Claude) │  │(Claude) │  │(Claude) │    │
-│  └─────────┘  └─────────┘  └─────────┘  └─────────┘    │
-│                                                           │
-│  courier.py  ─── watches panes, routes messages           │
-│  guardian.py ─── monitors health, restarts agents         │
-│  mcp-server/ ─── MCP tools for agent coordination        │
-└──────────────────────────────────────────────────────────┘
-         │ SSH
-┌─────────────────── worker machine ───────────────────────┐
-│  ┌─────────┐  ┌─────────┐                                │
-│  │agent-4  │  │agent-5  │  (Claude agents via SSH)       │
-│  │(Claude) │  │(Claude) │                                │
-│  └─────────┘  └─────────┘                                │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph "You"
+        CEO["Team Lead<br/>(CEO pane)"]
+    end
+
+    subgraph "Coordination Layer"
+        CLI["clawteam CLI<br/>send · broadcast · task · peek"]
+        Courier["Courier Daemon<br/>Message routing + P1 interrupts"]
+        Guardian["Guardian Watchdog<br/>Health monitoring + crash recovery"]
+        MCP["MCP Server<br/>Structured tools for agents"]
+    end
+
+    subgraph "Machine A (primary)"
+        A1["Agent 1<br/>CLAUDE.md role"]
+        A2["Agent 2<br/>CLAUDE.md role"]
+        A3["Agent 3<br/>CLAUDE.md role"]
+    end
+
+    subgraph "Machine B (worker via SSH)"
+        A4["Agent 4<br/>CLAUDE.md role"]
+        A5["Agent 5<br/>CLAUDE.md role"]
+    end
+
+    CEO -->|commands| CLI
+    CLI -->|dispatch| Courier
+    Courier -->|deliver| A1
+    Courier -->|deliver| A2
+    Courier -->|deliver| A3
+    Courier -->|deliver| A4
+    Courier -->|deliver| A5
+    Guardian -.->|monitor| A1
+    Guardian -.->|monitor| A2
+    Guardian -.->|monitor| A3
+    Guardian -.->|monitor| A4
+    Guardian -.->|monitor| A5
+    MCP <-->|tools| A1
+    MCP <-->|tools| A2
+    MCP <-->|tools| A3
 ```
 
-The primary machine runs the tmux session, courier, guardian, and MCP server. Worker machines host additional agent panes over SSH. All coordination (messages, tasks, health events) flows through the ClawTeam message bus.
+The primary machine runs the tmux session, courier, guardian, and MCP server. Worker machines host additional agent panes over SSH. All coordination flows through the ClawTeam message bus.
 
 ---
 
 ## Features
 
-- **Distributed execution** across multiple machines via SSH — scale agents beyond a single host
-- **Dynamic tmux layout** — auto-calculates columns and rows from agent count; resizes gracefully
-- **ClawTeam message bus** — inbox, broadcast, discussions, and task management between agents
-- **Courier daemon** — watches Claude panes, delivers messages, handles P1 interrupts, sends reminder pings
-- **Guardian daemon** — monitors CPU/temperature/RAM, revives dead agents, enforces resource limits
-- **MCP server** — gives each agent structured team tools: send message, read inbox, manage tasks
-- **Single config file** — `cluster.yaml` defines machines, agents, models, roles, and cgroup limits
-- **cgroup support** — CPU and memory limits per agent on Linux systems
-- **Graceful continue mode** — `--continue` flag reconnects to an existing session without restarting agents
+| Component | What it does |
+|-----------|-------------|
+| **Distributed execution** | Scale agents across machines via SSH — not limited to one host |
+| **Courier daemon** | Watches panes, routes messages, handles P1 priority interrupts, sends reminder pings |
+| **Guardian daemon** | Monitors CPU/temp/RAM, revives dead agents, enforces cgroup limits |
+| **ClawTeam message bus** | Inbox, broadcast, discussions, and task management between agents |
+| **MCP server** | Gives agents structured tools: `send_message`, `read_inbox`, `manage_tasks` |
+| **Dynamic tmux layout** | Auto-calculates grid from agent count; resizes gracefully |
+| **Single config file** | `cluster.yaml` defines machines, agents, models, roles, and resource limits |
+| **cgroup support** | CPU and memory limits per agent on Linux |
+| **Continue mode** | `--continue` reconnects to existing session without restarting agents |
 
 ---
 
@@ -57,13 +96,12 @@ The primary machine runs the tmux session, courier, guardian, and MCP server. Wo
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/your-org/soul-team.git
+git clone https://github.com/rishav1305/soul-team.git
 cd soul-team
 bash setup.sh
 
 # 2. Configure
 cp cluster.yaml.example ~/.config/soul-team/cluster.yaml
-# Edit cluster.yaml: set mode: local, define your agents
 nano ~/.config/soul-team/cluster.yaml
 
 # 3. Launch
@@ -74,46 +112,29 @@ soul-team
 
 ```bash
 # On the PRIMARY machine
-git clone https://github.com/your-org/soul-team.git && cd soul-team && bash setup.sh
+git clone https://github.com/rishav1305/soul-team.git && cd soul-team && bash setup.sh
 cp cluster.yaml.example ~/.config/soul-team/cluster.yaml
-# Edit cluster.yaml: add worker section with SSH host/user/agents
+# Edit: add worker section with SSH host, user, and agents
 nano ~/.config/soul-team/cluster.yaml
 
-# On each WORKER machine (SSH in first)
-git clone https://github.com/your-org/soul-team.git && cd soul-team && bash setup.sh
+# On each WORKER machine
+git clone https://github.com/rishav1305/soul-team.git && cd soul-team && bash setup.sh
 
 # Back on primary — launch everything
 soul-team
 ```
 
-The primary machine will SSH into workers, launch agent panes there, and integrate them into the shared session automatically.
+The primary machine SSHs into workers, launches agent panes, and integrates them into the shared session.
 
 ---
 
 ## cluster.yaml Reference
 
-| Field | Description | Example |
-|---|---|---|
-| `mode` | `local` or `distributed` | `distributed` |
-| `session` | tmux session name | `soul-team` |
-| `primary.host` | Primary machine hostname or IP | `primary.local` |
-| `primary.agents[]` | List of agents on the primary | see below |
-| `workers[]` | List of worker machine definitions | see below |
-| `agent.name` | Agent identifier (used for messaging) | `researcher` |
-| `agent.role` | Path to assistant.md role file | `agents/researcher.md` |
-| `agent.model` | Claude model to use | `claude-opus-4-5` |
-| `agent.cpu_quota` | CPU limit (Linux cgroups, %) | `50` |
-| `agent.memory_limit` | RAM limit (Linux cgroups) | `2G` |
-| `courier.interval` | Message poll interval in seconds | `5` |
-| `guardian.restart_on_exit` | Auto-revive dead agents | `true` |
-| `guardian.temp_limit_c` | Kill threshold in °C | `85` |
-| `guardian.ram_limit_pct` | Kill threshold % of total RAM | `90` |
-
-**Minimal cluster.yaml (local mode):**
+**Minimal config (local mode):**
 
 ```yaml
 mode: local
-session: soul-team
+session: my-team
 
 primary:
   agents:
@@ -133,21 +154,42 @@ guardian:
   ram_limit_pct: 90
 ```
 
+**Full reference:**
+
+| Field | Description | Example |
+|---|---|---|
+| `mode` | `local` or `distributed` | `distributed` |
+| `session` | tmux session name | `my-team` |
+| `primary.host` | Primary machine hostname/IP | `primary.local` |
+| `primary.agents[]` | Agents on the primary machine | see above |
+| `workers[]` | Worker machine definitions | `host`, `user`, `agents[]` |
+| `agent.name` | Agent identifier (used for messaging) | `developer` |
+| `agent.role` | Path to CLAUDE.md role file | `agents/developer.md` |
+| `agent.model` | Claude model | `claude-opus-4-5` |
+| `agent.cpu_quota` | CPU limit (cgroups, %) | `50` |
+| `agent.memory_limit` | RAM limit (cgroups) | `2G` |
+| `courier.interval` | Message poll interval (seconds) | `5` |
+| `guardian.restart_on_exit` | Auto-revive dead agents | `true` |
+| `guardian.temp_limit_c` | Thermal kill threshold (C) | `85` |
+| `guardian.ram_limit_pct` | RAM kill threshold (%) | `90` |
+
 ---
 
 ## Agent Roles
 
-Each agent is given a system prompt that defines its role. Templates live in `agents/`:
+Each agent gets a system prompt via a CLAUDE.md role file. Templates in `agents/`:
 
-| File | Role description |
+| File | Role |
 |---|---|
-| `agents/assistant.md` | General-purpose assistant; coordinates with other agents |
+| `agents/assistant.md` | General-purpose assistant; coordinates with teammates |
 | `agents/developer.md` | Software development; reads/writes code, runs tests |
-| `agents/researcher.md` | Research and summarization; uses web search and documents |
+| `agents/researcher.md` | Research and summarization; web search, documents |
 
-You can add custom role files — point `agent.role` to any `.md` file. The file is passed to `claude` as `--system-prompt`.
-
-Role files can include team-awareness instructions (who the other agents are, how to reach them) and MCP tool references (`send_message`, `read_inbox`, `create_task`).
+Create custom roles by pointing `agent.role` to any `.md` file. Role files define:
+- **Domain expertise** — what the agent knows and does
+- **Team awareness** — who the other agents are, how to reach them
+- **Tool access** — MCP tools (`send_message`, `read_inbox`, `create_task`)
+- **Escalation rules** — when to involve the team lead
 
 ---
 
@@ -160,34 +202,28 @@ soul-team [OPTIONS]
 
 Options:
   --config PATH       Path to cluster.yaml  [default: ~/.config/soul-team/cluster.yaml]
-  --continue          Reconnect to an existing session without restarting agents
+  --continue          Reconnect to existing session without restarting agents
   --dry-run           Print what would be launched without executing
   --no-guardian       Skip starting the guardian daemon
   --no-courier        Skip starting the courier daemon
   --session NAME      Override the tmux session name
-  -h, --help          Show this help message
+  -h, --help          Show help
 ```
 
 ### `soul-msg`
 
-```
-soul-msg <agent> <message>        Send a message to a named agent's inbox
-soul-msg --broadcast <message>    Send to all agents
-soul-msg --list                   List known agents and their last-seen time
-soul-msg --tasks                  Show open tasks
-```
-
-Examples:
-
 ```bash
-# Ask the researcher to summarize a paper
-soul-msg researcher "Please summarize arxiv:2401.00001 and post findings to broadcast"
+# Send a message to an agent
+soul-msg researcher "Summarize arxiv:2401.00001 and broadcast findings"
 
-# Broadcast a priority interrupt to all agents
-soul-msg --broadcast "STOP current work. Switch to hotfix branch immediately."
+# Broadcast to all agents
+soul-msg --broadcast "Switch to hotfix branch immediately."
 
-# List active agents
+# List active agents with last-seen time
 soul-msg --list
+
+# Show open tasks
+soul-msg --tasks
 ```
 
 ---
@@ -196,28 +232,28 @@ soul-msg --list
 
 ```
 soul-team/
-├── setup.sh                  # Installer script
-├── cluster.yaml.example      # Example configuration
 ├── bin/
-│   ├── soul-team             # Main launcher script
-│   └── soul-msg              # Message CLI
+│   ├── soul-team              # Main launcher
+│   └── soul-msg               # Message CLI
 ├── courier/
-│   ├── courier.py            # Message delivery daemon
-│   └── interrupt.py          # P1 interrupt handler
+│   ├── daemon.py              # Message delivery daemon
+│   ├── watcher.py             # Pane output watcher
+│   ├── formatter.py           # Message formatting
+│   └── pane.py                # tmux pane management
 ├── guardian/
-│   └── guardian.py           # Health monitor and agent revival daemon
+│   └── guardian.py            # Health monitor + agent revival
 ├── mcp-server/
-│   ├── server.py             # MCP server entry point
-│   └── tools/                # MCP tool definitions
-│       ├── messaging.py
-│       └── tasks.py
+│   └── server.py              # MCP tools for agent coordination
 ├── agents/
-│   ├── assistant.md          # Role template: general assistant
-│   ├── developer.md          # Role template: software developer
-│   └── researcher.md         # Role template: researcher
-└── systemd/
-    ├── soul-courier.service  # systemd user unit for courier
-    └── soul-guardian.service # systemd user unit for guardian
+│   ├── assistant.md           # Role: general assistant
+│   ├── developer.md           # Role: software developer
+│   └── researcher.md          # Role: researcher
+├── roles/                     # Extended role definitions
+├── systemd/
+│   ├── soul-courier.service   # systemd unit for courier
+│   └── soul-guardian.service  # systemd unit for guardian
+├── cluster.yaml.example       # Example configuration
+└── setup.sh                   # Installer
 ```
 
 ---
@@ -226,16 +262,12 @@ soul-team/
 
 | Dependency | Version | Required | Notes |
 |---|---|---|---|
-| tmux | ≥ 3.2 | Yes | Session and pane management |
-| Python | ≥ 3.11 | Yes | Courier, guardian, MCP server |
-| Claude Code CLI (`claude`) | latest | Yes | Runs each agent |
-| clawteam | latest | Yes | Message bus (inbox/broadcast/tasks) |
-| PyYAML | any | Yes | Config parsing (`pip install PyYAML`) |
-| psutil | any | Yes | Process/resource monitoring (`pip install psutil`) |
-| jq | any | No | Optional panes.json manipulation |
+| tmux | 3.2+ | Yes | Session and pane management |
+| Python | 3.11+ | Yes | Courier, guardian, MCP server |
+| Claude Code CLI | latest | Yes | Runs each agent |
+| PyYAML | any | Yes | `pip install PyYAML` |
+| psutil | any | Yes | `pip install psutil` |
 | systemd | any | No | Optional service management |
-
-Install Python dependencies:
 
 ```bash
 pip install --user PyYAML psutil
@@ -243,8 +275,20 @@ pip install --user PyYAML psutil
 
 ---
 
+## Related Projects
+
+| Repo | What it does |
+|------|-------------|
+| [SoulGraph](https://github.com/rishav1305/soulgraph) | Multi-agent AI framework — RAG + Evaluation + Fine-tuning + Orchestration |
+| [soul](https://github.com/rishav1305/soul) | Full-stack AI platform — 13 Go microservices, React frontend, 127 Claude tools |
+| [soul-bench](https://github.com/rishav1305/soul-bench) | CARS benchmark — 52 LLMs scored by quality per dollar per second |
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
-Contributions welcome. Open an issue or pull request on GitHub.
+---
+
+Built by [Rishav Chatterjee](https://rishavchatterjee.com) · [LinkedIn](https://linkedin.com/in/rishavchatterjee) · [GitHub](https://github.com/rishav1305)
