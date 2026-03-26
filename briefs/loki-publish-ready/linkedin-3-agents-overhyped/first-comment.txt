@@ -1,7 +1,0 @@
-This is based on running 9 specialized agents daily across distributed hardware. SoulGraph is the coordination layer I'm building in public.
-
-The three patterns that make it work: inbox protocol, conference protocol, and skill sharing. Architecture details at rishavchatterjee.com
-
-github.com/rishav1305/soulgraph
-
--- Rishav Chatterjee
