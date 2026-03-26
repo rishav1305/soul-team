@@ -279,9 +279,11 @@ pip install --user PyYAML psutil
 
 | Repo | What it does |
 |------|-------------|
-| [SoulGraph](https://github.com/rishav1305/soulgraph) | Multi-agent AI framework — RAG + Evaluation + Fine-tuning + Orchestration |
+| [SoulGraph](https://github.com/rishav1305/soulgraph) | Multi-agent RAG framework — LangGraph + ChromaDB + RAGAS evaluation |
 | [soul](https://github.com/rishav1305/soul) | Full-stack AI platform — 13 Go microservices, React frontend, 127 Claude tools |
-| [soul-bench](https://github.com/rishav1305/soul-bench) | CARS benchmark — 52 LLMs scored by quality per dollar per second |
+| [soul-bench](https://github.com/rishav1305/soul-bench) | CARS benchmark — cost-adjusted LLM evaluation (52 models, 7 providers) |
+| [preset-toolkit](https://github.com/rishav1305/preset-toolkit) | Claude Code plugin for safe Preset/Superset dashboard management |
+| [dbt-toolkit](https://github.com/rishav1305/dbt-toolkit) | Claude Code plugin for dbt workflow automation |
 
 ---
 
@@ -291,4 +293,9 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-Built by [Rishav Chatterjee](https://rishavchatterjee.com) · [LinkedIn](https://linkedin.com/in/rishavchatterjee) · [GitHub](https://github.com/rishav1305)
+**Rishav Chatterjee** — Senior AI Architect
+
+- Portfolio: [rishavchatterjee.com](https://rishavchatterjee.com)
+- CARS Dashboard: [rishavchatterjee.com/cars](https://rishavchatterjee.com/cars)
+- GitHub: [github.com/rishav1305](https://github.com/rishav1305)
+- LinkedIn: [linkedin.com/in/rishavchatterjee](https://linkedin.com/in/rishavchatterjee)
