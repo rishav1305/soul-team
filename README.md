@@ -74,6 +74,25 @@ The primary machine runs the tmux session, courier, guardian, and MCP server. Wo
 
 ---
 
+## Production Stats
+
+Running continuously on 2 machines (Raspberry Pi 5 + x86 server) since March 21, 2026:
+
+| Metric | Value |
+|--------|-------|
+| **Agents managed** | 11 (across 2 machines) |
+| **Messages routed** | 3,100+ |
+| **Messages delivered** | 3,161 (0 pending) |
+| **Broadcasts sent** | 191 |
+| **Avg messages/day** | 484 |
+| **Group discussions** | 1 (multi-agent thread) |
+| **Active hours/day** | 22 of 24 |
+| **Operational uptime** | 6 days continuous |
+
+All stats pulled from live courier event logs. Zero external dependencies required.
+
+---
+
 ## Features
 
 | Component | What it does |
