@@ -26,6 +26,7 @@ Environment:
 import argparse
 import hashlib
 import json
+import threading
 import os
 import re
 import signal
@@ -38,7 +39,7 @@ from pathlib import Path
 
 # -- Constants ----------------------------------------------------------------
 
-VERSION = "2.0.0"
+VERSION = "2.5.0"
 
 # System limits
 TEMP_LIMIT_C = 80          # degrees C -- kill newest agent above this
@@ -52,10 +53,28 @@ SPEND_INTERVAL_S = 60      # seconds between spend checks
 
 # Auto-restart
 MAX_RESTARTS_PER_HOUR = 3
+RESTART_STAGGER_S = 90         # min seconds between consecutive agent restarts (boot storm)
+IDLE_WAKE_STAGGER_S = 20       # min seconds between idle-wake restarts (surgical)
+
+# Idle shutdown
+IDLE_TIMEOUT_S = 300           # 5 min of no pane activity before shutdown
+IDLE_PRE_EXIT_WAIT_S = 30     # save window before /exit
+IDLE_CHECK_INTERVAL_S = 60    # check idle state every minute
+IDLE_WAKE_BOOT_WAIT_S = 3     # wait for TUI after launch (no trust prompt)
+IDLE_WAKE_DEDUP_S = 5          # dedup window for inbox watcher events
+IDLE_POLL_FALLBACK_S = 300    # 5 min periodic poll as inotify safety net
+
+# Hot period (disable idle shutdown during launch days)
+HOT_PERIOD_FILE = Path.home() / ".soul" / "hot-period"
 
 # Auto-compact
 COMPACT_COOLDOWN_S = 300   # 5 minutes
-MSG_COUNT_COMPACT_THRESHOLD = 200
+COMPACT_PRE_SAVE_WAIT_S = 30  # seconds to wait after injecting save directive
+MSG_COUNT_COMPACT_THRESHOLD = 100
+
+# Context budget monitor
+CONTEXT_EARLY_COMPACT_PCT = 70.0  # Trigger compact at 70% context usage
+CONTEXT_LOG_PCT = 50.0            # Start logging at 50% context usage
 
 # Spend limits
 SPEND_ALERT_USD = 48.0     # 80% of $60 cap
@@ -109,15 +128,26 @@ TOKEN_PATTERNS = [
         r"[Tt]okens?:\s*([\d,]+)\s+input\s*/\s*([\d,]+)\s+output",
         re.IGNORECASE,
     ),
-    # "Context: 45%" or "Context window: 45%"
-    re.compile(r"[Cc]ontext(?:\s+window)?:\s*(\d+(?:\.\d+)?)\s*%"),
+    # "Context: 45%" or "ctx:45%" (Claude Code status bar format)
+    re.compile(r"(?:[Cc]ontext(?:\s+window)?:\s*|ctx:)(\d+(?:\.\d+)?)\s*%"),
     # "Cost: $0.42" or similar
     re.compile(r"[Cc]ost:\s*\$?([\d.]+)"),
 ]
 
+# JSONL-based token tracking state
+_jsonl_offsets: dict[str, int] = {}   # file_path -> last byte offset
+_agent_jsonl_map: dict[str, str] = {}  # agent_name -> active JSONL path
+_jsonl_map_refresh_ts: float = 0.0     # last time we refreshed the map
+JSONL_MAP_REFRESH_S = 300              # refresh agent→JSONL mapping every 5 min
+
 # -- Configurable Paths -------------------------------------------------------
 
 HOME = Path.home()
+CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+
+# Memory enforcement
+MEMORY_SCANNER_PATH = HOME / ".claude" / "scripts" / "memory-scanner.py"
+POST_RESTART_AUDIT_DELAY_S = 45  # wait for agent to boot before auditing
 
 DB_PATH = Path(
     os.environ.get("SOUL_GUARDIAN_DB", str(HOME / ".soul" / "guardian.db"))
@@ -232,6 +262,18 @@ def db_init(conn: sqlite3.Connection) -> None:
             trigger TEXT NOT NULL,
             details TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS memory_audit (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            total_directives INTEGER DEFAULT 0,
+            saved INTEGER DEFAULT 0,
+            unsaved INTEGER DEFAULT 0,
+            passed INTEGER DEFAULT 0,
+            details TEXT
+        );
     """)
     conn.commit()
 
@@ -242,6 +284,18 @@ def db_log_heal(conn: sqlite3.Connection, agent: str, event_type: str,
         "INSERT INTO self_heal_events (timestamp, agent, event_type, trigger, details) "
         "VALUES (?, ?, ?, ?, ?)",
         (now_iso(), agent, event_type, trigger, details),
+    )
+    conn.commit()
+
+
+def db_log_memory_audit(conn: sqlite3.Connection, agent: str,
+                        trigger: str, total: int, saved: int,
+                        unsaved: int, passed: bool, details: str = "") -> None:
+    conn.execute(
+        "INSERT INTO memory_audit "
+        "(timestamp, agent, trigger, total_directives, saved, unsaved, passed, details) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (now_iso(), agent, trigger, total, saved, unsaved, int(passed), details),
     )
     conn.commit()
 
@@ -362,10 +416,11 @@ class AgentState:
         self.last_output_hash = ""
         self.last_compact_ts = 0.0
         self.msg_count = 0
-        self.status = "active"  # active | idle | stuck | crashed | unreachable
+        self.status = "active"  # active | idle | stuck | crashed | unreachable | idle_shutdown
         self.restart_timestamps: list[float] = []  # last N restart times
         self.spend_alert_sent_today = False
         self.spend_date = ""
+        self.last_activity_ts = time.time()  # last pane output change
 
     def __repr__(self) -> str:
         return (
@@ -605,6 +660,10 @@ def restart_count_last_hour(state: AgentState) -> int:
     return len(state.restart_timestamps)
 
 
+# Global restart stagger: track last restart time across ALL agents
+_last_restart_ts: float = 0.0
+
+
 def maybe_restart_agent(
     state: AgentState, conn: sqlite3.Connection, dry_run: bool = False
 ) -> bool:
@@ -619,7 +678,18 @@ def maybe_restart_agent(
     if not pane_is_shell_prompt(last):
         return False
 
-    # Check cooldown
+    # Stagger: don't restart if another agent was restarted recently
+    global _last_restart_ts
+    since_last = time.time() - _last_restart_ts
+    if since_last < RESTART_STAGGER_S:
+        remaining = int(RESTART_STAGGER_S - since_last)
+        log(
+            f"[{state.name}] Shell prompt detected but stagger active "
+            f"({remaining}s remaining) -- deferring restart"
+        )
+        return False
+
+    # Check per-agent cooldown
     count = restart_count_last_hour(state)
     if count >= MAX_RESTARTS_PER_HOUR:
         warn(
@@ -650,13 +720,17 @@ def maybe_restart_agent(
         send_enter(state.pane_id)
 
     if success:
-        state.restart_timestamps.append(time.time())
+        now_ts = time.time()
+        state.restart_timestamps.append(now_ts)
+        _last_restart_ts = now_ts  # Update global stagger timestamp
         state.status = "active"
         db_log_heal(
             conn, state.name, "restart", "shell_prompt",
             f"last_line={last!r:.80} restart_count={count + 1}"
         )
         log(f"[{state.name}] Restarted (cmd sent to pane {state.pane_id})")
+        # Schedule memory re-read injection after agent boots
+        _pending_memory_audits[state.name] = now_ts + POST_RESTART_AUDIT_DELAY_S
         # Only notify CEO when restart limit is hit (noise reduction)
         if count + 1 >= MAX_RESTARTS_PER_HOUR:
             notify_ceo(
@@ -667,6 +741,121 @@ def maybe_restart_agent(
     else:
         err(f"[{state.name}] send-keys failed for restart")
         return False
+
+
+# -- Memory enforcement -------------------------------------------------------
+
+_pending_memory_audits: dict[str, float] = {}  # agent -> scheduled_time
+
+
+def inject_memory_reread(state: AgentState, conn: sqlite3.Connection,
+                         dry_run: bool = False) -> bool:
+    """
+    After restart, inject a P1 message telling the agent to re-read its memory
+    and shared KB before doing anything else.
+    """
+    msg = (
+        "[P1 INTERRUPT from guardian] You were just restarted. "
+        "Before doing anything, READ your memory files at "
+        "~/.claude/agent-memory/{name}/ and the shared knowledge base at "
+        "~/soul-roles/shared/knowledge-base/. "
+        "Do not accept any tasks until you have re-read your context. "
+        "Then: check your interrupted-state memory and resume if applicable, "
+        "and check your inbox via clawteam."
+    ).format(name=state.name)
+
+    log(f"[{state.name}] Injecting post-restart memory re-read P1")
+
+    if dry_run:
+        log(f"[{state.name}] DRY-RUN: would inject memory re-read P1")
+        return False
+
+    success = send_keys(state.pane_id, msg)
+    if success:
+        send_enter(state.pane_id)
+        db_log_heal(conn, state.name, "memory_reread_inject", "post_restart")
+        # Schedule a memory audit for this agent
+        _pending_memory_audits[state.name] = time.time() + POST_RESTART_AUDIT_DELAY_S
+        return True
+    return False
+
+
+def run_memory_audit(agent: str, conn: sqlite3.Connection,
+                     trigger: str = "manual") -> dict:
+    """
+    Run the memory scanner for a specific agent and log results.
+    Returns dict with audit results.
+    """
+    if not MEMORY_SCANNER_PATH.exists():
+        warn(f"Memory scanner not found at {MEMORY_SCANNER_PATH}")
+        return {"error": "scanner_not_found"}
+
+    try:
+        result = subprocess.run(
+            ["python3", str(MEMORY_SCANNER_PATH), "--check", "--agent", agent, "--json"],
+            capture_output=True, text=True, timeout=60,
+        )
+        output = result.stdout.strip()
+        if not output:
+            warn(f"[{agent}] Memory scanner returned empty output")
+            return {"error": "empty_output"}
+
+        data = json.loads(output)
+        if not data:
+            return {"error": "no_data"}
+
+        report = data[0]  # Single agent
+        total = report.get("total_directives", 0)
+        saved = report.get("saved", 0)
+        unsaved = report.get("unsaved", 0)
+        passed = report.get("pass", True)
+
+        db_log_memory_audit(
+            conn, agent, trigger, total, saved, unsaved, passed,
+            f"memory_files={len(report.get('memory_files', []))}"
+        )
+
+        if not passed:
+            warn(
+                f"[{agent}] MEMORY AUDIT FAILED: {unsaved} unsaved directives "
+                f"out of {total} total"
+            )
+            notify_ceo(
+                f"[guardian] Memory audit FAILED for {agent}: "
+                f"{unsaved}/{total} directives not saved to memory"
+            )
+        else:
+            log(f"[{agent}] Memory audit PASSED: {saved}/{total} directives saved")
+
+        return report
+
+    except subprocess.TimeoutExpired:
+        err(f"[{agent}] Memory scanner timed out")
+        return {"error": "timeout"}
+    except (json.JSONDecodeError, OSError) as e:
+        err(f"[{agent}] Memory scanner error: {e}")
+        return {"error": str(e)}
+
+
+def check_pending_memory_audits(agent_states: dict, conn: sqlite3.Connection,
+                                dry_run: bool = False) -> None:
+    """Check and run any pending memory audits (scheduled after restarts/compacts)."""
+    now = time.time()
+    completed = []
+    for agent, scheduled_time in _pending_memory_audits.items():
+        if now >= scheduled_time:
+            if dry_run:
+                log(f"[{agent}] DRY-RUN: would run post-restart memory audit")
+            else:
+                # Inject memory re-read P1 if agent has a pane
+                state = agent_states.get(agent)
+                if state and state.pane_id:
+                    inject_memory_reread(state, conn, dry_run=dry_run)
+                # Run the scanner
+                run_memory_audit(agent, conn, trigger="post_restart")
+            completed.append(agent)
+    for agent in completed:
+        del _pending_memory_audits[agent]
 
 
 # -- Auto-compact -------------------------------------------------------------
@@ -699,11 +888,384 @@ def maybe_compact_agent(
         log(f"[{state.name}] DRY-RUN: would send /compact")
         return False
 
+    # Pre-compact: inject directive save message, wait, then compact
+    save_msg = (
+        "CONTEXT COMPACT INCOMING — You have 30 seconds. "
+        "Save any unsaved CEO directives, decisions, or important state "
+        "to your memory or shared KB NOW. Then compaction will proceed."
+    )
+    log(f"[{state.name}] Injecting pre-compact save directive")
+    send_keys(state.pane_id, save_msg)
+    send_enter(state.pane_id)
+    db_log_heal(conn, state.name, "pre_compact_save_inject", trigger)
+
+    # Wait for agent to process the save request
+    time.sleep(COMPACT_PRE_SAVE_WAIT_S)
+
+    # Now send compact
     send_keys(state.pane_id, "/compact")
     send_enter(state.pane_id)
-    state.last_compact_ts = now
+    state.last_compact_ts = time.time()
     db_log_heal(conn, state.name, "compact", trigger)
+
+    # Schedule memory audit after compact settles
+    _pending_memory_audits[state.name] = time.time() + POST_RESTART_AUDIT_DELAY_S
+
     return True
+
+
+# -- Context budget monitor ----------------------------------------------------
+
+_context_alerts_sent: dict[str, float] = {}  # agent -> last alert timestamp
+
+
+def check_context_budget(
+    state: AgentState, conn: sqlite3.Connection, dry_run: bool = False
+) -> bool:
+    """
+    Parse context percentage from pane output.
+    If >= CONTEXT_EARLY_COMPACT_PCT (70%), trigger early compact.
+    Returns True if compact was triggered.
+    """
+    # Skip if we just compacted (respect cooldown)
+    now = time.time()
+    if now - state.last_compact_ts < COMPACT_COOLDOWN_S:
+        return False
+
+    output = capture_pane(state.pane_id, lines=50)
+    if not output.strip():
+        return False
+
+    # Parse context percentage from pane
+    ctx_pct = 0.0
+    for line in output.splitlines():
+        m = TOKEN_PATTERNS[1].search(line)  # "Context: 45%" pattern
+        if m:
+            ctx_pct = float(m.group(1))
+            break
+
+    if ctx_pct < CONTEXT_LOG_PCT:
+        return False
+
+    # Log at 50%+ for monitoring
+    log(f"[{state.name}] Context usage: {ctx_pct:.0f}%")
+
+    # Trigger early compact at 70%+
+    if ctx_pct >= CONTEXT_EARLY_COMPACT_PCT:
+        trigger = f"context_budget={ctx_pct:.0f}%"
+        log(
+            f"[{state.name}] CONTEXT BUDGET WARNING: {ctx_pct:.0f}% >= "
+            f"{CONTEXT_EARLY_COMPACT_PCT:.0f}% threshold -- triggering early compact"
+        )
+
+        if dry_run:
+            log(f"[{state.name}] DRY-RUN: would trigger early compact")
+            return False
+
+        # Pre-compact save directive
+        save_msg = (
+            "CONTEXT COMPACT INCOMING — You have 30 seconds. "
+            "Save any unsaved CEO directives, decisions, or important state "
+            "to your memory or shared KB NOW. Then compaction will proceed."
+        )
+        log(f"[{state.name}] Injecting pre-compact save directive (context budget)")
+        send_keys(state.pane_id, save_msg)
+        send_enter(state.pane_id)
+        db_log_heal(conn, state.name, "pre_compact_save_inject", trigger)
+
+        # Wait for agent to process the save request
+        time.sleep(COMPACT_PRE_SAVE_WAIT_S)
+
+        # Now send compact
+        send_keys(state.pane_id, "/compact")
+        send_enter(state.pane_id)
+        state.last_compact_ts = time.time()
+        db_log_heal(conn, state.name, "compact", trigger)
+
+        # Schedule memory audit after compact settles
+        _pending_memory_audits[state.name] = time.time() + POST_RESTART_AUDIT_DELAY_S
+
+        # Notify CEO on first 70%+ event per hour per agent
+        last_alert = _context_alerts_sent.get(state.name, 0.0)
+        if now - last_alert > 3600:
+            notify_ceo(
+                f"[guardian] {state.name} hit {ctx_pct:.0f}% context usage — "
+                f"auto-compacting to prevent crash loop"
+            )
+            _context_alerts_sent[state.name] = now
+
+        return True
+
+    return False
+
+
+# -- Idle shutdown ------------------------------------------------------------
+
+# Active indicators: do NOT idle-shutdown if these appear in recent output
+ACTIVE_INDICATORS = [
+    "\u2801", "\u2802", "\u2804", "\u2808", "\u2810", "\u2820",  # braille spinner
+    "Running", "Executing", "in_progress", "Thinking",
+    "searching", "reading", "writing", "editing",
+]
+
+# Per-agent wake dedup tracking
+_last_wake_ts: dict[str, float] = {}  # agent -> last wake timestamp
+
+# Inbox paths for inotify / poll
+_INBOX_DIR = HOME / "soul-roles" / "shared" / "inbox"
+_COURIER_QUEUE_DIR = HOME / ".local" / "share" / "soul-team" / "teams" / TEAM_NAME / "inboxes"
+
+
+def is_hot_period() -> bool:
+    """Check if hot period mode is active (disable idle shutdown)."""
+    if not HOT_PERIOD_FILE.exists():
+        return False
+    try:
+        content = HOT_PERIOD_FILE.read_text().strip()
+        expiry = datetime.fromisoformat(content)
+        if datetime.now(expiry.tzinfo or None) > expiry:
+            HOT_PERIOD_FILE.unlink(missing_ok=True)
+            log("Hot period expired — idle shutdown re-enabled")
+            return False
+        return True
+    except (ValueError, OSError):
+        return True  # file exists but unparseable → assume hot
+
+
+def has_pending_messages(agent: str) -> bool:
+    """Check if agent has unprocessed inbox files or queued courier messages."""
+    # Filesystem inbox
+    inbox = _INBOX_DIR / agent
+    if inbox.is_dir():
+        for f in inbox.iterdir():
+            if f.suffix in (".md", ".json", ".txt") and f.stat().st_size > 0:
+                return True
+
+    # Courier queue
+    queue_file = _COURIER_QUEUE_DIR / f"{agent}.json"
+    if queue_file.exists():
+        try:
+            data = json.loads(queue_file.read_text())
+            if isinstance(data, list) and len(data) > 0:
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return False
+
+
+def is_agent_idle(state: AgentState) -> bool:
+    """
+    Check if agent has been idle for IDLE_TIMEOUT_S.
+    Idle = no pane output change + no active indicators + no pending messages.
+    """
+    if state.status == "idle_shutdown":
+        return False  # Already shut down
+
+    output = capture_pane(state.pane_id, lines=5)
+    output_hash = hashlib.md5(output.encode()).hexdigest()
+
+    if output_hash != state.last_output_hash:
+        state.last_output_hash = output_hash
+        state.last_activity_ts = time.time()
+        return False
+
+    # Check for active indicators
+    if any(ind in output for ind in ACTIVE_INDICATORS):
+        state.last_activity_ts = time.time()
+        return False
+
+    # Check courier queue for pending messages
+    if has_pending_messages(state.name):
+        return False
+
+    return (time.time() - state.last_activity_ts) >= IDLE_TIMEOUT_S
+
+
+def idle_shutdown_agent(
+    state: AgentState, conn: sqlite3.Connection, dry_run: bool = False
+) -> bool:
+    """
+    Gracefully shut down an idle agent.
+    Injects save directive, waits, then sends /exit.
+    Returns True if shutdown was triggered.
+    """
+    if is_hot_period():
+        log(f"[{state.name}] Hot period active — idle shutdown suppressed")
+        return False
+
+    if state.name in CRITICAL_AGENTS:
+        return False
+
+    log(f"[{state.name}] Idle for {IDLE_TIMEOUT_S}s — initiating idle shutdown")
+
+    if dry_run:
+        log(f"[{state.name}] DRY-RUN: would idle-shutdown now")
+        return False
+
+    # Step 1: Inject pre-exit save message
+    save_msg = (
+        "IDLE SHUTDOWN INCOMING — You have 30 seconds. "
+        "Save any unsaved state to memory NOW (interrupted-state, "
+        "unsaved directives, work in progress). Then you will be exited."
+    )
+    send_keys(state.pane_id, save_msg)
+    send_enter(state.pane_id)
+    db_log_heal(conn, state.name, "idle_pre_exit_save", "idle_timeout")
+
+    # Step 2: Wait for save
+    time.sleep(IDLE_PRE_EXIT_WAIT_S)
+
+    # Step 3: Send /exit
+    send_keys(state.pane_id, "/exit")
+    send_enter(state.pane_id)
+    time.sleep(5)
+
+    # Step 4: Verify exit — if TUI still showing, force it
+    output = capture_pane(state.pane_id, lines=3)
+    if not pane_is_shell_prompt(pane_last_line(output)):
+        send_keys(state.pane_id, "C-c")
+        time.sleep(1)
+        send_keys(state.pane_id, "/exit")
+        send_enter(state.pane_id)
+        time.sleep(3)
+
+    # Step 5: Mark as idle_shutdown
+    state.status = "idle_shutdown"
+    db_log_heal(conn, state.name, "idle_shutdown", "idle_timeout",
+                f"idle_for={IDLE_TIMEOUT_S}s")
+    log(f"[{state.name}] Idle shutdown complete")
+
+    return True
+
+
+def wake_agent(
+    state: AgentState, conn: sqlite3.Connection, trigger: str = "inbox_file",
+    dry_run: bool = False
+) -> bool:
+    """
+    Wake an idle-shutdown agent. Optimized path: 12-18s to first message.
+    Uses IDLE_WAKE_STAGGER_S (not RESTART_STAGGER_S) for faster response.
+    """
+    if state.status != "idle_shutdown":
+        return False
+
+    # Dedup: skip if this agent was woken recently
+    now = time.time()
+    last_wake = _last_wake_ts.get(state.name, 0.0)
+    if now - last_wake < IDLE_WAKE_DEDUP_S:
+        return False
+
+    # Stagger: use shorter idle-wake stagger
+    global _last_restart_ts
+    if now - _last_restart_ts < IDLE_WAKE_STAGGER_S:
+        remaining = int(IDLE_WAKE_STAGGER_S - (now - _last_restart_ts))
+        log(f"[{state.name}] Idle-wake stagger active ({remaining}s remaining)")
+        return False
+
+    log(f"[{state.name}] Waking from idle shutdown (trigger: {trigger})")
+
+    if dry_run:
+        log(f"[{state.name}] DRY-RUN: would wake now")
+        return False
+
+    # Build and send launch command
+    launch_cmd = build_launch_cmd(state.name, state.model, state.machine)
+    if not launch_cmd:
+        err(f"[{state.name}] Could not build launch command for idle-wake")
+        return False
+
+    cmd_str = subprocess.list2cmdline(launch_cmd)
+    success = send_keys(state.pane_id, cmd_str)
+    if success:
+        send_enter(state.pane_id)
+
+    if not success:
+        err(f"[{state.name}] send-keys failed for idle-wake")
+        return False
+
+    # Wait for TUI to load (NO trust prompt sleep — dangerously-skip-permissions)
+    time.sleep(IDLE_WAKE_BOOT_WAIT_S)
+
+    # Optimized boot prompt: memory + inbox only, skip daily routine
+    boot_msg = (
+        f"You were idle-shutdown by Guardian. "
+        f"Read your memory at ~/.claude/agent-memory/{state.name}/ "
+        f"then check inbox: clawteam inbox receive soul-team --agent {state.name}. "
+        f"Skip daily routine — process inbox immediately."
+    )
+    send_keys(state.pane_id, boot_msg)
+    send_enter(state.pane_id)
+
+    # Update state
+    now_ts = time.time()
+    _last_restart_ts = now_ts
+    _last_wake_ts[state.name] = now_ts
+    state.status = "active"
+    state.last_activity_ts = now_ts
+    state.restart_timestamps.append(now_ts)
+
+    db_log_heal(conn, state.name, "idle_wake", trigger)
+    log(f"[{state.name}] Idle-wake complete (trigger: {trigger})")
+
+    # Schedule memory audit after boot
+    _pending_memory_audits[state.name] = now_ts + POST_RESTART_AUDIT_DELAY_S
+
+    return True
+
+
+# -- Inbox watcher (inotify thread) -------------------------------------------
+
+class InboxWatcherThread(threading.Thread):
+    """
+    Background thread that watches agent inbox directories via polling.
+    When a new file appears for an idle-shutdown agent, queues a wake event.
+    Uses polling instead of inotify for sshfs compatibility (Pepper review note #2).
+    """
+
+    def __init__(self, agent_states: dict[str, AgentState],
+                 conn: sqlite3.Connection, dry_run: bool = False):
+        super().__init__(daemon=True, name="inbox-watcher")
+        self.agent_states = agent_states
+        self.conn = conn
+        self.dry_run = dry_run
+        self._stop_event = threading.Event()
+        self._wake_queue: list[tuple[str, str]] = []  # (agent, trigger)
+        self._lock = threading.Lock()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def get_pending_wakes(self) -> list[tuple[str, str]]:
+        """Drain the wake queue. Called from main loop."""
+        with self._lock:
+            wakes = list(self._wake_queue)
+            self._wake_queue.clear()
+            return wakes
+
+    def run(self):
+        """Poll inbox dirs every IDLE_POLL_FALLBACK_S for idle agents."""
+        log("[inbox-watcher] Started (poll mode for sshfs compatibility)")
+        while not self._stop_event.is_set():
+            try:
+                for name, state in list(self.agent_states.items()):
+                    if state.status != "idle_shutdown":
+                        continue
+
+                    if has_pending_messages(name):
+                        with self._lock:
+                            # Dedup: don't queue if already in queue
+                            queued = {w[0] for w in self._wake_queue}
+                            if name not in queued:
+                                self._wake_queue.append((name, "inbox_poll"))
+                                log(f"[inbox-watcher] {name}: pending messages detected, queuing wake")
+
+            except Exception as e:
+                warn(f"[inbox-watcher] Error during poll: {e}")
+
+            self._stop_event.wait(IDLE_POLL_FALLBACK_S)
+
+        log("[inbox-watcher] Stopped")
 
 
 # -- Auto-continue ------------------------------------------------------------
@@ -797,42 +1359,278 @@ def parse_tokens_from_pane(output: str) -> dict:
     return result
 
 
+def _refresh_agent_jsonl_map() -> None:
+    """Scan ~/.claude/projects/ to find the active JSONL file per agent.
+
+    Scans local project dirs. For remote machines (titan-pc), uses SSH to
+    find the active JSONL and copies incremental data.
+    """
+    global _agent_jsonl_map, _jsonl_map_refresh_ts
+    _jsonl_map_refresh_ts = time.time()
+
+    import glob as _glob
+    jsonl_files = _glob.glob(str(CLAUDE_PROJECTS_DIR / "*" / "*.jsonl"))
+    # Sort by mtime descending — most recent first
+    jsonl_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+
+    seen_agents: set[str] = set()
+    new_map: dict[str, str] = {}
+
+    for fpath in jsonl_files:
+        # Skip subagent files and old files (>24h)
+        if "/subagents/" in fpath:
+            continue
+        try:
+            age = time.time() - os.path.getmtime(fpath)
+            if age > 86400:  # skip files older than 24h
+                continue
+            with open(fpath) as fh:
+                first_line = fh.readline()
+                if not first_line.strip():
+                    continue
+                d = json.loads(first_line)
+                agent = d.get("agentSetting", "")
+                if agent and agent not in seen_agents:
+                    new_map[agent] = fpath
+                    seen_agents.add(agent)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    # Also scan remote machines for their agent JSONL files
+    for machine_name, machine_cfg in _machines_config.items():
+        ssh_target = machine_cfg.get("ssh_target", "")
+        if not ssh_target:
+            continue
+        try:
+            # Find recent JSONL files on remote machine, extract agent names
+            cmd = (
+                f"python3 -c \""
+                f"import json,os,glob,time; now=time.time(); "
+                f"files=glob.glob(os.path.expanduser('~/.claude/projects/*/*.jsonl')); "
+                f"recent=[(f,os.path.getmtime(f)) for f in files if now-os.path.getmtime(f)<86400 and '/subagents/' not in f]; "
+                f"recent.sort(key=lambda x:-x[1]); "
+                f"seen=set(); "
+                f"[print(json.dumps({{'agent':json.loads(open(f).readline()).get('agentSetting',''),'path':f}})) "
+                f"for f,_ in recent[:20] "
+                f"if json.loads(open(f).readline()).get('agentSetting','') and "
+                f"json.loads(open(f).readline()).get('agentSetting','') not in seen and "
+                f"not seen.add(json.loads(open(f).readline()).get('agentSetting',''))]"
+                f"\""
+            )
+            ssh_args = machine_cfg.get("ssh_args", [])
+            r = subprocess.run(
+                ["ssh"] + ssh_args + [ssh_target, cmd],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.strip().splitlines():
+                    try:
+                        info = json.loads(line)
+                        agent = info.get("agent", "")
+                        remote_path = info.get("path", "")
+                        if agent and agent not in seen_agents and remote_path:
+                            # Store as "ssh://target:path" for remote scanning
+                            new_map[agent] = f"ssh://{ssh_target}:{remote_path}"
+                            seen_agents.add(agent)
+                    except json.JSONDecodeError:
+                        continue
+        except (subprocess.SubprocessError, OSError) as e:
+            warn(f"Remote JSONL scan failed for {machine_name}: {e}")
+
+    _agent_jsonl_map = new_map
+    if new_map:
+        log(f"Token JSONL map refreshed: {', '.join(f'{k}={os.path.basename(v)[:12]}' for k,v in new_map.items())}")
+
+
+def _scan_jsonl_incremental(fpath: str, agent_models: dict[str, str],
+                             agent_name: str) -> dict | None:
+    """
+    Read new assistant messages from a JSONL file since last offset.
+    Supports local files and remote files via ssh:// prefix.
+    Returns aggregated token usage dict or None if no new data.
+    """
+    global _jsonl_offsets
+
+    if fpath.startswith("ssh://"):
+        return _scan_jsonl_remote(fpath, agent_models, agent_name)
+
+    try:
+        file_size = os.path.getsize(fpath)
+    except OSError:
+        return None
+
+    last_offset = _jsonl_offsets.get(fpath, 0)
+    if file_size <= last_offset:
+        return None  # no new data
+
+    total_input = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_create = 0
+    msg_count = 0
+    model_seen = ""
+
+    try:
+        with open(fpath) as fh:
+            fh.seek(last_offset)
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if d.get("type") != "assistant":
+                    continue
+
+                msg = d.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+
+                usage = msg.get("usage", {})
+                if not usage:
+                    continue
+
+                total_input += usage.get("input_tokens", 0)
+                total_output += usage.get("output_tokens", 0)
+                total_cache_read += usage.get("cache_read_input_tokens", 0)
+                total_cache_create += usage.get("cache_creation_input_tokens", 0)
+                model_seen = msg.get("model", model_seen)
+                msg_count += 1
+
+            _jsonl_offsets[fpath] = fh.tell()
+    except OSError:
+        return None
+
+    if msg_count == 0:
+        return None
+
+    return _compute_cost(total_input, total_output, total_cache_read,
+                         msg_count, model_seen, agent_models, agent_name)
+
+
+def _scan_jsonl_remote(fpath: str, agent_models: dict[str, str],
+                        agent_name: str) -> dict | None:
+    """Scan a remote JSONL file via SSH. fpath format: ssh://target:path"""
+    global _jsonl_offsets
+
+    # Parse ssh://target:path
+    rest = fpath[6:]  # strip "ssh://"
+    colon_idx = rest.index(":")
+    ssh_target = rest[:colon_idx]
+    remote_path = rest[colon_idx + 1:]
+
+    last_offset = _jsonl_offsets.get(fpath, 0)
+
+    # Use tail -c + to read from byte offset, then parse assistant messages
+    cmd = (
+        f"python3 -c \""
+        f"import json,os,sys; "
+        f"f=open('{remote_path}'); f.seek({last_offset}); "
+        f"ti=to=cr=cc=mc=0; ms=''; "
+        f"[("
+        f"  setattr(sys,'_d',json.loads(l)),"
+        f"  (ti:=ti+sys._d.get('message',{{}}).get('usage',{{}}).get('input_tokens',0),"
+        f"   to:=to+sys._d.get('message',{{}}).get('usage',{{}}).get('output_tokens',0),"
+        f"   cr:=cr+sys._d.get('message',{{}}).get('usage',{{}}).get('cache_read_input_tokens',0),"
+        f"   mc:=mc+1) if sys._d.get('type')=='assistant' and sys._d.get('message',{{}}).get('usage') else None"
+        f") for l in f if l.strip()]; "
+        f"print(json.dumps({{'in':ti,'out':to,'cr':cr,'mc':mc,'off':f.tell(),"
+        f"'model':''}}))  "
+        f"\""
+    )
+
+    try:
+        r = subprocess.run(
+            ["ssh", ssh_target, cmd],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return None
+
+        data = json.loads(r.stdout.strip().splitlines()[-1])
+        if data["mc"] == 0:
+            return None
+
+        _jsonl_offsets[fpath] = data["off"]
+        return _compute_cost(
+            data["in"], data["out"], data["cr"],
+            data["mc"], data.get("model", ""),
+            agent_models, agent_name,
+        )
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _compute_cost(total_input: int, total_output: int, total_cache_read: int,
+                   msg_count: int, model_seen: str,
+                   agent_models: dict[str, str], agent_name: str) -> dict:
+    """Compute token cost and return usage dict."""
+    if "opus" in model_seen:
+        rate_key = "opus"
+    else:
+        model_key = agent_models.get(agent_name, "sonnet")
+        rate_key = "opus" if "opus" in model_key else "sonnet"
+    rates = COST_RATES.get(rate_key, COST_RATES["sonnet"])
+
+    cost = (
+        total_input * rates["input"]
+        + total_output * rates["output"]
+        + total_cache_read * rates["cache_read"]
+    )
+
+    return {
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "cache_tokens": total_cache_read,
+        "cost_usd": cost,
+        "msg_count": msg_count,
+    }
+
+
 def scan_tokens_for_agent(
     state: AgentState, conn: sqlite3.Connection, agent_models: dict[str, str]
 ) -> None:
-    """Capture pane output and attempt to extract token data. Upserts to DB."""
-    output = capture_pane(state.pane_id, lines=50)
-    if not output.strip():
+    """
+    Read token usage from agent's JSONL conversation file.
+    Falls back to pane-scraping for context percentage only.
+    """
+    global _jsonl_map_refresh_ts
+
+    # Refresh JSONL map periodically
+    if time.time() - _jsonl_map_refresh_ts >= JSONL_MAP_REFRESH_S:
+        _refresh_agent_jsonl_map()
+
+    # Get context % from pane (cheap, still useful)
+    ctx_pct = 0.0
+    output = capture_pane(state.pane_id, lines=10)
+    if output:
+        for line in output.splitlines():
+            m = TOKEN_PATTERNS[1].search(line)  # ctx:XX% pattern
+            if m:
+                ctx_pct = float(m.group(1))
+                break
+
+    # Scan JSONL for actual token data
+    jsonl_path = _agent_jsonl_map.get(state.name)
+    if not jsonl_path:
         return
 
-    parsed = parse_tokens_from_pane(output)
+    result = _scan_jsonl_incremental(jsonl_path, agent_models, state.name)
+    if not result:
+        return
 
-    # If we found token counts but no cost, compute from rates
-    if parsed["input_tokens"] or parsed["output_tokens"]:
-        model_key = agent_models.get(state.name, state.model)
-        # Normalize model key to opus/sonnet
-        if "opus" in model_key:
-            rate_key = "opus"
-        else:
-            rate_key = "sonnet"
-        rates = COST_RATES.get(rate_key, COST_RATES["sonnet"])
-
-        if parsed["cost_usd"] == 0.0:
-            parsed["cost_usd"] = (
-                parsed["input_tokens"] * rates["input"]
-                + parsed["output_tokens"] * rates["output"]
-                + parsed["cache_tokens"] * rates["cache_read"]
-            )
-
-        db_upsert_token_usage(
-            conn,
-            state.name,
-            parsed["input_tokens"],
-            parsed["output_tokens"],
-            parsed["cache_tokens"],
-            parsed["cost_usd"],
-            parsed["context_pct"],
-        )
+    db_upsert_token_usage(
+        conn,
+        state.name,
+        result["input_tokens"],
+        result["output_tokens"],
+        result["cache_tokens"],
+        result["cost_usd"],
+        ctx_pct,
+    )
 
 
 # -- Spend alerts + hard cap --------------------------------------------------
@@ -1144,8 +1942,17 @@ def run_daemon(dry_run: bool = False, once: bool = False) -> None:
     agent_states = build_agent_states(agent_models)
     log(f"Detected agents: {list(agent_states.keys())}")
 
+    # Initialize JSONL-based token tracking map
+    _refresh_agent_jsonl_map()
+
     last_token_scan = 0.0
     last_spend_check = 0.0
+    last_idle_check = 0.0
+
+    # Start inbox watcher thread for idle-wake
+    inbox_watcher = InboxWatcherThread(agent_states, conn, dry_run=dry_run)
+    inbox_watcher.start()
+    log("[idle] InboxWatcherThread started")
 
     iteration = 0
     while _running:
@@ -1168,19 +1975,57 @@ def run_daemon(dry_run: bool = False, once: bool = False) -> None:
                         agent_states[name] = AgentState(name, pane_id, model, "local")
                         log(f"[{name}] New agent pane detected: {pane_id}")
 
+            # -- Process wake queue from InboxWatcherThread
+            for agent_name, trigger in inbox_watcher.get_pending_wakes():
+                ws = agent_states.get(agent_name)
+                if ws and ws.status == "idle_shutdown":
+                    wake_agent(ws, conn, trigger=trigger, dry_run=dry_run)
+
+            # -- Idle detection (every IDLE_CHECK_INTERVAL_S, not every 30s)
+            run_idle_check = (now - last_idle_check >= IDLE_CHECK_INTERVAL_S)
+            if run_idle_check:
+                last_idle_check = now
+
             # -- Per-agent checks
             for name, state in list(agent_states.items()):
                 if not state.pane_id:
                     continue
 
-                # Auto-restart
-                maybe_restart_agent(state, conn, dry_run=dry_run)
+                # Skip all checks for idle-shutdown agents (they're not crashed)
+                if state.status == "idle_shutdown":
+                    continue
 
-                # Auto-compact
-                maybe_compact_agent(state, conn, dry_run=dry_run)
+                # Auto-restart
+                restarted = maybe_restart_agent(state, conn, dry_run=dry_run)
+
+                # Post-restart: inject memory re-read P1 (after boot delay)
+                if restarted and not dry_run:
+                    # The memory re-read will be injected after the audit delay
+                    # (scheduled in maybe_restart_agent via _pending_memory_audits)
+                    pass
+
+                # Context budget monitor (early compact at 70%)
+                context_compacted = check_context_budget(
+                    state, conn, dry_run=dry_run
+                )
+
+                # Auto-compact (includes pre-compact save injection)
+                # Skip if context budget already triggered compact
+                if not context_compacted:
+                    maybe_compact_agent(state, conn, dry_run=dry_run)
 
                 # Auto-continue
                 maybe_continue_agent(state, conn, dry_run=dry_run)
+
+                # Idle detection -- check if agent should be shutdown
+                if run_idle_check and is_agent_idle(state):
+                    if is_hot_period():
+                        log(f"[{name}] Hot period active -- idle shutdown suppressed")
+                    else:
+                        idle_shutdown_agent(state, conn, dry_run=dry_run)
+
+            # -- Memory audit checks (pending from restarts/compacts)
+            check_pending_memory_audits(agent_states, conn, dry_run=dry_run)
 
             # -- Token tracking -- every 60s
             if now - last_token_scan >= TOKEN_INTERVAL_S:
@@ -1207,6 +2052,11 @@ def run_daemon(dry_run: bool = False, once: bool = False) -> None:
             if not _running:
                 break
             time.sleep(0.5)
+
+    # Stop inbox watcher thread
+    inbox_watcher.stop()
+    inbox_watcher.join(timeout=10)
+    log("[idle] InboxWatcherThread stopped")
 
     log("soul-guardian shutdown complete")
     conn.close()
