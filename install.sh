@@ -81,20 +81,8 @@ LEGACY_CONFIG="$HOME/.claude/config/soul-team.toml"
 if [[ ! -f "$CONFIG_FILE" ]] && [[ ! -f "$LEGACY_CONFIG" ]]; then
     echo -e "  ${BOLD}No team configuration found.${NC}"
     echo ""
-    echo "  Would you like to run the interactive setup wizard?"
-    echo -e "  This will configure your agents, deployment mode, and team rules."
+    echo "  Run 'soul-team' to start the interactive setup."
     echo ""
-    read -rp "  Run soul-team init? [Y/n]: " INIT_ANSWER
-    INIT_ANSWER="${INIT_ANSWER:-y}"
-    if [[ "${INIT_ANSWER,,}" == "y" || "${INIT_ANSWER,,}" == "yes" ]]; then
-        echo ""
-        python3 "$INSTALL_DIR/bin/soul-init"
-    else
-        echo ""
-        echo "  Skipped. You can run it later:"
-        echo -e "  ${BOLD}soul-team init${NC}        # Interactive wizard"
-        echo -e "  ${BOLD}soul-team init --quick${NC} # Quick start (3 agents, no prompts)"
-    fi
 fi
 
 # ── 5. Done ─────────────────────────────────────────────────
@@ -103,10 +91,9 @@ echo -e "${GREEN}=========================================="
 echo -e "  soul-team is ready!"
 echo -e "==========================================${NC}"
 echo ""
-echo "  Quick start:"
+echo "  Get started:"
 echo ""
-echo -e "  ${BOLD}soul-team init${NC}          # Configure your team (if not done yet)"
-echo -e "  ${BOLD}soul-team${NC}               # Launch your agent team"
+echo -e "  ${BOLD}soul-team${NC}               # Interactive setup + launch (one command)"
 echo ""
 echo "  To update later:"
 echo -e "  ${BOLD}cd $INSTALL_DIR && git pull && ./setup.sh${NC}"

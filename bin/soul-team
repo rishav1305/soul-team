@@ -1,642 +1,2626 @@
-#!/bin/bash
-# soul-team — Launch the Marvel agent team (v2)
-#
-# Usage:
-#   soul-team init                      # Interactive setup wizard
-#   soul-team init --quick              # Quick start (3 agents, no prompts)
-#   soul-team init --quick -n 5         # Quick start with 5 agents
-#   soul-team                           # Launch all agents (default)
-#   soul-team --agents happy,shuri     # Launch only specific agents
-#   soul-team --agents happy           # Launch only Happy
-#   soul-team --all                     # Explicit all (same as no flags)
-#   soul-team --continue                # Reattach + heal + revive dead agents
-#   soul-team --dry-run                 # Validate config without launching
-#   soul-team --dry-run --agents happy  # Validate specific agent subset
-#
-# Management subcommands (post-setup reconfiguration):
-#   soul-team add-agent developer       # Add agent from template
-#   soul-team add-agent --custom        # Interactive custom agent
-#   soul-team remove-agent developer-1  # Remove an agent
-#   soul-team add-machine worker-2 user@host  # Add remote machine
-#   soul-team list-agents               # Show current roster
-#   soul-team list-machines             # Show machines
-#   soul-team config                    # Show current config
-#   soul-team config --set stagger_seconds=15  # Direct config change
-#
-# Layout adapts dynamically to agent count:
-#   1-3 agents: CEO + 1 column
-#   4-6 agents: CEO + 2 columns
-#   7-9 agents: CEO + 3 columns (original layout)
-#
-# Agents launch in INTERACTIVE mode (TUI) with staggered startup.
-# Trust prompt auto-accepted. Boot prompt typed after TUI loads.
-#
-# Features:
-#   - Config: $SOUL_TEAM_CONFIG > ~/.soul-team/config.toml > ~/.claude/config/soul-team.toml > ./config/soul-team.toml.example
-#   - Dynamic tmux layout based on selected agent count
-#   - Conditional titan-pc SSH (skipped when only local agents)
-#   - Scoped panes.json + sidecars (only selected agents)
-#   - Global daemons always start (router, bridge, heartbeat, guardian)
+#!/usr/bin/env python3
+"""
+soul-team -- One command to rule them all.
 
-set -euo pipefail
+Interactive CLI for managing multi-agent Claude Code teams.
+Detects state automatically: first run -> setup wizard, configured -> launch,
+session running -> management dashboard.
 
-# ── Subcommands: delegate management commands to soul-init ────────────────────
-_MGMT_CMDS="init add-agent remove-agent add-machine list-agents list-machines config"
-if [[ " $_MGMT_CMDS " == *" ${1:-} "* ]]; then
-    REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-    exec python3 "${REPO_ROOT}/bin/soul-init" "$@"
-fi
+Usage:
+    soul-team                         # Interactive mode (auto-detects state)
+    soul-team --dry-run               # Validate config without launching
+    soul-team --agents happy,shuri    # Launch specific agents only
+    soul-team --continue              # Reattach + heal + revive dead agents
+    soul-team --status                # Quick status check (non-interactive)
 
-SESSION="soul-team"
-PC="rishav@192.168.0.196"
-C="claude --permission-mode bypassPermissions"
-DEV_AGENTS="shuri happy"  # Agents that load CLAUDE-dev.md (code conventions)
-BOOT="Run your daily routine then enter proactive mode when idle."
-DELAY=10
-CLAWTEAM="$HOME/.local/bin/clawteam"
-# ── Config resolution: env var > ~/.soul-team/ > ~/.claude/config/ > repo example
-_resolve_toml() {
-    if [ -n "${SOUL_TEAM_CONFIG:-}" ] && [ -f "$SOUL_TEAM_CONFIG" ]; then
-        echo "$SOUL_TEAM_CONFIG"
-    elif [ -f "$HOME/.soul-team/config.toml" ]; then
-        echo "$HOME/.soul-team/config.toml"
-    elif [ -f "$HOME/.claude/config/soul-team.toml" ]; then
-        echo "$HOME/.claude/config/soul-team.toml"
-    elif [ -f "${REPO_ROOT:-./}/config/soul-team.toml.example" ]; then
-        echo "${REPO_ROOT:-./}/config/soul-team.toml.example"
-    else
-        echo ""
-    fi
+Stdlib only -- no external dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ANSI ESCAPE CODES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+ITALIC = "\033[3m"
+UNDERLINE = "\033[4m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+RED = "\033[0;31m"
+CYAN = "\033[0;36m"
+MAGENTA = "\033[0;35m"
+BLUE = "\033[0;34m"
+WHITE = "\033[1;37m"
+GRAY = "\033[0;90m"
+NC = "\033[0m"  # No Color / Reset
+
+# Box-drawing characters
+BOX_TL = "\u256d"  # top-left
+BOX_TR = "\u256e"  # top-right
+BOX_BL = "\u2570"  # bottom-left
+BOX_BR = "\u256f"  # bottom-right
+BOX_H = "\u2500"   # horizontal
+BOX_V = "\u2502"   # vertical
+BULLET = "\u2022"  # bullet
+CHECK = "\u2713"   # checkmark
+CROSS = "\u2717"   # cross
+ARROW = "\u276f"   # arrow
+DOT = "\u25cf"     # filled circle
+CIRCLE = "\u25cb"  # empty circle
+
+VERSION = "2.0.0"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PATHS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+TEMPLATES_DIR = REPO_ROOT / "agents" / "templates"
+PROTOCOL_SRC = REPO_ROOT / "protocols" / "team-protocol-v2.md"
+SYSTEMD_SRC = REPO_ROOT / "systemd"
+
+HOME = Path.home()
+USER_CONFIG_DIR = HOME / ".soul-team"
+CLAUDE_CONFIG_DIR = HOME / ".claude" / "config"
+CLAUDE_AGENTS_DIR = HOME / ".claude" / "agents"
+CLAUDE_LOGS_DIR = HOME / ".claude" / "logs"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# INTERACTIVE MENU SYSTEM (stdlib only: termios + ANSI)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _supports_raw_mode() -> bool:
+    """Check if the terminal supports raw mode input."""
+    try:
+        import termios  # noqa: F401
+        return sys.stdin.isatty()
+    except ImportError:
+        return False
+
+
+def _read_key() -> str:
+    """Read a single keypress in raw mode. Returns key identifier string."""
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+
+        if ch == "\x1b":
+            # Escape sequence
+            seq = sys.stdin.read(1)
+            if seq == "[":
+                code = sys.stdin.read(1)
+                if code == "A":
+                    return "up"
+                elif code == "B":
+                    return "down"
+                elif code == "C":
+                    return "right"
+                elif code == "D":
+                    return "left"
+            return "escape"
+        elif ch in ("\r", "\n"):
+            return "enter"
+        elif ch == "\x03":
+            return "ctrl-c"
+        elif ch == "\x04":
+            return "ctrl-d"
+        elif ch == "\x7f" or ch == "\x08":
+            return "backspace"
+        elif ch == "q" or ch == "Q":
+            return "q"
+        elif ch == "r" or ch == "R":
+            return "r"
+        else:
+            return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _clear_lines(n: int) -> None:
+    """Move cursor up n lines and clear them."""
+    for _ in range(n):
+        sys.stdout.write("\033[A")  # Move up
+        sys.stdout.write("\033[2K")  # Clear line
+    sys.stdout.flush()
+
+
+def _hide_cursor() -> None:
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+
+def _show_cursor() -> None:
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+
+
+def select_menu(title: str, options: list[str], descriptions: list[str] | None = None,
+                default: int = 0, back_option: bool = False) -> int:
+    """Arrow-key navigable menu. Returns selected index, or -1 for back.
+
+    Falls back to numbered-list selection if raw mode not available.
+    If back_option is True, adds a back option that returns -1.
+    """
+    display_options = list(options)
+    display_descs = list(descriptions) if descriptions else None
+    if back_option:
+        display_options.append(f"{ARROW} Back")
+        if display_descs is not None:
+            display_descs.append("")
+
+    if not _supports_raw_mode():
+        return _select_menu_fallback(title, display_options, display_descs, default, back_option)
+
+    cursor = default
+    num_opts = len(display_options)
+
+    _hide_cursor()
+    try:
+        while True:
+            # Render
+            lines = []
+            lines.append(f"  {BOLD}?{NC} {title}")
+            for i, opt in enumerate(display_options):
+                if i == cursor:
+                    prefix = f"  {CYAN}{ARROW}{NC} "
+                    line = f"{prefix}{BOLD}{opt}{NC}"
+                else:
+                    line = f"    {DIM}{opt}{NC}"
+
+                if display_descs and display_descs[i]:
+                    line += f"  {GRAY}{display_descs[i]}{NC}"
+
+                lines.append(line)
+
+            output = "\n".join(lines)
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
+
+            key = _read_key()
+
+            # Clear rendered lines
+            _clear_lines(len(lines))
+
+            if key == "up":
+                cursor = (cursor - 1) % num_opts
+            elif key == "down":
+                cursor = (cursor + 1) % num_opts
+            elif key == "enter":
+                # Show final selection
+                selected_text = display_options[cursor]
+                sys.stdout.write(f"  {GREEN}{CHECK}{NC} {title} {BOLD}{selected_text}{NC}\n")
+                sys.stdout.flush()
+                if back_option and cursor == num_opts - 1:
+                    return -1
+                return cursor
+            elif key == "ctrl-c":
+                _show_cursor()
+                raise KeyboardInterrupt()
+            elif key == "escape":
+                if back_option:
+                    sys.stdout.write(f"  {YELLOW}{ARROW}{NC} {title} {DIM}(back){NC}\n")
+                    sys.stdout.flush()
+                    return -1
+            elif key == "q" and back_option:
+                sys.stdout.write(f"  {YELLOW}{ARROW}{NC} {title} {DIM}(back){NC}\n")
+                sys.stdout.flush()
+                return -1
+    finally:
+        _show_cursor()
+
+
+def _select_menu_fallback(title: str, options: list[str], descriptions: list[str] | None,
+                          default: int, back_option: bool) -> int:
+    """Numbered list fallback when terminal doesn't support raw mode."""
+    print(f"  {BOLD}?{NC} {title}")
+    for i, opt in enumerate(options):
+        marker = f"{GREEN}>{NC}" if i == default else " "
+        desc = f"  {GRAY}{descriptions[i]}{NC}" if descriptions and descriptions[i] else ""
+        print(f"    {marker} {i + 1}. {opt}{desc}")
+
+    while True:
+        raw = input(f"    Choice [{default + 1}]: ").strip()
+        if not raw:
+            return -1 if (back_option and default == len(options) - 1) else default
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                if back_option and idx == len(options) - 1:
+                    return -1
+                return idx
+        except ValueError:
+            pass
+        print(f"    {RED}Enter 1-{len(options)}.{NC}")
+
+
+def confirm(prompt: str, default: bool = True) -> bool:
+    """Y/n confirmation prompt."""
+    if _supports_raw_mode():
+        hint = f"{'Y' if default else 'y'}/{'n' if default else 'N'}"
+        sys.stdout.write(f"  {BOLD}?{NC} {prompt} [{hint}] ")
+        sys.stdout.flush()
+
+        _hide_cursor()
+        try:
+            while True:
+                key = _read_key()
+                if key == "enter":
+                    result = default
+                    break
+                elif key in ("y", "Y"):
+                    result = True
+                    break
+                elif key in ("n", "N"):
+                    result = False
+                    break
+                elif key == "ctrl-c":
+                    _show_cursor()
+                    raise KeyboardInterrupt()
+        finally:
+            _show_cursor()
+
+        # Clear the prompt line and show result
+        sys.stdout.write("\r\033[2K")
+        answer = f"{GREEN}Yes{NC}" if result else f"{RED}No{NC}"
+        sys.stdout.write(f"  {GREEN}{CHECK}{NC} {prompt} {answer}\n")
+        sys.stdout.flush()
+        return result
+
+    # Fallback
+    hint = "Y/n" if default else "y/N"
+    raw = input(f"  {BOLD}?{NC} {prompt} [{hint}]: ").strip().lower()
+    if not raw:
+        return default
+    return raw in ("y", "yes")
+
+
+def text_input(prompt: str, default: str = "", allow_empty: bool = False) -> str:
+    """Text input with default value."""
+    if default:
+        display = f"  {BOLD}?{NC} {prompt} {DIM}({default}){NC}: "
+    else:
+        display = f"  {BOLD}?{NC} {prompt}: "
+
+    while True:
+        answer = input(display).strip()
+        if not answer and default:
+            print(f"\033[A\033[2K  {GREEN}{CHECK}{NC} {prompt} {BOLD}{default}{NC}")
+            return default
+        if answer or allow_empty:
+            print(f"\033[A\033[2K  {GREEN}{CHECK}{NC} {prompt} {BOLD}{answer}{NC}")
+            return answer
+        print(f"    {RED}Please enter a value.{NC}")
+
+
+def number_input(prompt: str, default: int, min_val: int = 1, max_val: int = 99) -> int:
+    """Validated number input."""
+    while True:
+        raw = text_input(prompt, str(default))
+        try:
+            val = int(raw)
+            if min_val <= val <= max_val:
+                return val
+            print(f"    {RED}Enter a number between {min_val} and {max_val}.{NC}")
+        except ValueError:
+            print(f"    {RED}Enter a valid number.{NC}")
+
+
+def multi_select(title: str, options: list[str], descriptions: list[str] | None = None) -> list[int]:
+    """Multi-select with space to toggle, enter to confirm. Returns list of indices."""
+    if not _supports_raw_mode():
+        return _multi_select_fallback(title, options, descriptions)
+
+    selected = set()
+    cursor = 0
+    num_opts = len(options)
+
+    _hide_cursor()
+    try:
+        while True:
+            lines = []
+            lines.append(f"  {BOLD}?{NC} {title} {DIM}(space to toggle, enter to confirm){NC}")
+            for i, opt in enumerate(options):
+                check = f"{GREEN}{CHECK}{NC}" if i in selected else f"{DIM}{CIRCLE}{NC}"
+                if i == cursor:
+                    prefix = f"  {CYAN}{ARROW}{NC}"
+                else:
+                    prefix = "   "
+
+                line = f"{prefix} {check} {opt}"
+                if descriptions and descriptions[i]:
+                    line += f"  {GRAY}{descriptions[i]}{NC}"
+                lines.append(line)
+
+            output = "\n".join(lines)
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
+
+            key = _read_key()
+            _clear_lines(len(lines))
+
+            if key == "up":
+                cursor = (cursor - 1) % num_opts
+            elif key == "down":
+                cursor = (cursor + 1) % num_opts
+            elif key == " ":
+                if cursor in selected:
+                    selected.discard(cursor)
+                else:
+                    selected.add(cursor)
+            elif key == "enter":
+                chosen = sorted(selected)
+                names = ", ".join(options[i] for i in chosen) if chosen else "(none)"
+                sys.stdout.write(f"  {GREEN}{CHECK}{NC} {title} {BOLD}{names}{NC}\n")
+                sys.stdout.flush()
+                return chosen
+            elif key == "ctrl-c":
+                _show_cursor()
+                raise KeyboardInterrupt()
+    finally:
+        _show_cursor()
+
+
+def _multi_select_fallback(title: str, options: list[str], descriptions: list[str] | None) -> list[int]:
+    """Comma-separated number fallback for multi-select."""
+    print(f"  {BOLD}?{NC} {title}")
+    for i, opt in enumerate(options):
+        desc = f"  {GRAY}{descriptions[i]}{NC}" if descriptions and descriptions[i] else ""
+        print(f"    {i + 1}. {opt}{desc}")
+    while True:
+        raw = input(f"    Select (comma-separated, e.g. 1,3,5): ").strip()
+        if not raw:
+            return []
+        try:
+            indices = [int(x.strip()) - 1 for x in raw.split(",")]
+            if all(0 <= i < len(options) for i in indices):
+                return indices
+        except ValueError:
+            pass
+        print(f"    {RED}Enter valid numbers separated by commas.{NC}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# UI PRIMITIVES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def banner() -> None:
+    """Print the soul-team welcome banner."""
+    width = 45
+    print()
+    print(f"  {CYAN}{BOX_TL}{BOX_H * width}{BOX_TR}{NC}")
+    print(f"  {CYAN}{BOX_V}{NC}{' ' * ((width - 20) // 2)}{BOLD}{WHITE}soul-team v{VERSION}{NC}{' ' * ((width - 19) // 2)}{CYAN}{BOX_V}{NC}")
+    print(f"  {CYAN}{BOX_V}{NC}{' ' * ((width - 36) // 2)}{DIM}Multi-Agent Runtime for Claude Code{NC}{' ' * ((width - 35) // 2)}{CYAN}{BOX_V}{NC}")
+    print(f"  {CYAN}{BOX_BL}{BOX_H * width}{BOX_BR}{NC}")
+    print()
+
+
+def section_header(title: str) -> None:
+    """Print a section header."""
+    print()
+    print(f"  {CYAN}{BOX_H * 3} {title} {BOX_H * max(1, 45 - len(title))}{NC}")
+    print()
+
+
+def ok(msg: str) -> None:
+    print(f"  {GREEN}{CHECK}{NC} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"  {YELLOW}!{NC} {msg}")
+
+
+def fail(msg: str) -> None:
+    print(f"  {RED}{CROSS}{NC} {msg}")
+
+
+def info(msg: str) -> None:
+    print(f"  {BOLD}{msg}{NC}")
+
+
+def status_dot(label: str, ok: bool) -> str:
+    """Return a colored status dot with label."""
+    dot = f"{GREEN}{DOT}{NC}" if ok else f"{RED}{DOT}{NC}"
+    return f"{label} {dot}"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DATA MODELS (carried over from soul-init)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AVAILABLE_TEMPLATES = [
+    "developer", "researcher", "assistant", "strategist", "writer", "analyst",
+    "pm", "designer", "devops", "qa", "data-engineer", "security",
+    "marketer", "sales", "coach", "finance",
+]
+
+TEMPLATE_DESCRIPTIONS = {
+    "developer": "Code, TDD, CI, sprint planning",
+    "researcher": "Market analysis, competitive intel",
+    "assistant": "Task management, scheduling",
+    "strategist": "Strategy, GTM, alignment",
+    "writer": "Content, copywriting, SEO",
+    "analyst": "Data science, ML, visualization",
+    "pm": "Product management, roadmap",
+    "designer": "UI/UX, wireframes, design systems",
+    "devops": "CI/CD, Docker, monitoring",
+    "qa": "Testing, E2E, bug triage",
+    "data-engineer": "Pipelines, ETL, warehousing",
+    "security": "Vulnerability scanning, compliance",
+    "marketer": "Campaigns, SEO, growth",
+    "sales": "Outreach, pipeline, CRM",
+    "coach": "Interview prep, learning",
+    "finance": "Budgeting, forecasting",
 }
-TOML="$(_resolve_toml)"
-PANES_JSON="$HOME/.clawteam/teams/soul-team/panes.json"
 
-# ── Repo root (resolve via symlink from ~/.local/bin/ back to repo) ────────
-REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+QUICK_START_TEMPLATES = ["developer", "researcher", "assistant"]
+MODEL_OPTIONS = ["opus", "sonnet", "haiku"]
 
-# ── Parse TOML via single helper (parse_toml.py + jq) ─────────────────────
-PARSE_TOML="${REPO_ROOT}/ops/parse_toml.py"
-if [ -f "$TOML" ] && [ -f "$PARSE_TOML" ]; then
-    TOML_JSON=$(python3 "$PARSE_TOML" "$TOML" 2>/dev/null)
-    if [ -n "$TOML_JSON" ]; then
-        TOML_BOOT=$(echo "$TOML_JSON" | jq -r '.boot_prompt // empty')
-        TOML_DELAY=$(echo "$TOML_JSON" | jq -r '.stagger_seconds // empty')
-        [ -n "$TOML_BOOT" ]  && BOOT="$TOML_BOOT"
-        [ -n "$TOML_DELAY" ] && DELAY="$TOML_DELAY"
-        echo "Config loaded from $TOML (stagger=${DELAY}s)"
-    else
-        echo "Warning: parse_toml.py failed — using defaults"
-    fi
-else
-    echo "Warning: $TOML or $PARSE_TOML not found — using defaults"
-fi
 
-# ── Extract agent names + machine types from parsed TOML JSON ────────────────
-ALL_AGENTS_STR=$(echo "$TOML_JSON" | jq -r '[.agents[].name] | join(" ")' 2>/dev/null)
-read -ra ALL_AGENTS <<< "$ALL_AGENTS_STR"
+@dataclass
+class Machine:
+    """A remote machine for distributed deployment."""
+    name: str
+    ssh_target: str
+    verified: bool = False
 
-# Build AGENT_MACHINE associative array from parsed JSON
-declare -A AGENT_MACHINE
-while IFS=$'\t' read -r agent_name agent_machine; do
-    AGENT_MACHINE["$agent_name"]="$agent_machine"
-done < <(echo "$TOML_JSON" | jq -r '.agent_machines | to_entries[] | [.key, .value] | @tsv')
 
-# ── Cleanup stale processes ──────────────────────────────────────────────────
-cleanup_stale() {
-    echo "Cleaning up stale processes..."
-    pkill -f "soul-sidecar.sh" 2>/dev/null || true
-    pkill -f "soul-sidecar-wrapper.sh" 2>/dev/null || true
-    systemctl --user stop soul-courier.service 2>/dev/null || true
-    pkill -f "soul-bridge.py" 2>/dev/null || true
-    tmux kill-session -t soul-team 2>/dev/null || true
-    rm -f ~/.clawteam/teams/soul-team/sidecar/*-seen.log
-    rm -f ~/.clawteam/teams/soul-team/sidecar/*-interrupt.lock
-    for f in ~/.clawteam/teams/soul-team/queue/*.json; do
-        [ -f "$f" ] && echo '[]' > "$f"
-    done
-    echo "Cleanup done."
-}
+@dataclass
+class Agent:
+    """An agent definition."""
+    name: str
+    role: str
+    model: str = "sonnet"
+    machine: str = "local"
+    template: Optional[str] = None
+    cgroup: bool = True
 
-# ── Continue mode: reattach + heal + revive ─────────────────────────────────
-get_agent_launch_cmd() {
-    local agent="$1"
-    local model
-    model=$(echo "$TOML_JSON" | jq -r --arg a "$agent" '.agents[] | select(.name == $a) | .model // "sonnet"' 2>/dev/null)
-    [ -z "$model" ] && model="sonnet"
-    local dev_flag=""
-    [[ " $DEV_AGENTS " == *" $agent "* ]] && dev_flag="--append-system-prompt-file /home/rishav/.claude/CLAUDE-dev.md"
-    echo "cd /home/rishav && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 $C --agent-id ${agent}@${SESSION} --agent-name ${agent} --team-name ${SESSION} --agent-color pink --agent-type ${agent} --model ${model} ${dev_flag}"
-}
 
-if [[ "${1:-}" == "--continue" ]]; then
-    # Phase 1: Validate session exists
-    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-        echo "No soul-team session found. Run 'soul-team' to start fresh."
-        exit 1
-    fi
-    echo "Continuing soul-team session..."
+@dataclass
+class TeamConfig:
+    """Full team configuration."""
+    team_name: str = "my-team"
+    deployment_mode: str = "single"
+    boot_prompt: str = "Run your daily routine then enter proactive mode when idle."
+    stagger_seconds: int = 10
+    enable_guardian: bool = True
+    enable_courier: bool = True
+    enable_idle_shutdown: bool = False
+    idle_timeout_minutes: int = 15
+    permission_mode: str = "bypassPermissions"
+    agent_memory: bool = True
+    communication_protocol: str = "full"
+    agents: list[Agent] = field(default_factory=list)
+    machines: list[Machine] = field(default_factory=list)
 
-    # Phase 2: Heal — restart courier with fresh pane validation
-    systemctl --user restart soul-courier.service 2>/dev/null || true
-    pgrep -f "soul-router.py" >/dev/null || {
-        python3 "${REPO_ROOT}/router/router.py" >> "$HOME/.claude/logs/soul-router.log" 2>&1 &
-        echo "  Router restarted (PID: $!)"
-    }
 
-    # Phase 3: Revive dead agents
-    if [ -f "$PANES_JSON" ]; then
-        for agent in $(jq -r 'keys[]' "$PANES_JSON"); do
-            pane_id=$(jq -r ".\"$agent\"" "$PANES_JSON")
-            content=$(tmux capture-pane -p -t "$pane_id" -S -5 2>/dev/null) || content=""
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIG RESOLUTION & TOML I/O
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            if [ -z "$content" ] || echo "$content" | grep -qE '^\$\s*$|^[a-z]+@[a-zA-Z0-9-]+[^>]*\$\s*$'; then
-                echo "  Reviving $agent in pane $pane_id..."
-                launch_cmd=$(get_agent_launch_cmd "$agent")
-                tmux send-keys -t "$pane_id" "$launch_cmd" Enter
-            else
-                echo "  $agent: alive"
-            fi
-        done
-    fi
+def _resolve_config_path() -> Path:
+    """Resolve the active config file path."""
+    env_val = os.environ.get("SOUL_TEAM_CONFIG")
+    if env_val:
+        p = Path(env_val)
+        if p.exists():
+            return p
+    primary = USER_CONFIG_DIR / "config.toml"
+    if primary.exists():
+        return primary
+    legacy = CLAUDE_CONFIG_DIR / "soul-team.toml"
+    if legacy.exists():
+        return legacy
+    return primary  # Default write target
 
-    # Phase 4: Attach
-    echo "Attaching to soul-team..."
-    tmux attach-session -t "$SESSION"
-    exit 0
-fi
 
-# ── Parse CLI flags ──────────────────────────────────────────────────────────
-SELECTED_AGENTS=()
-USE_ALL=false
-DRY_RUN=false
+def _load_toml(path: Path) -> dict:
+    """Load a TOML file using stdlib tomllib."""
+    import tomllib
+    with open(path, "rb") as f:
+        return tomllib.load(f)
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --agents)
-            if [[ -z "${2:-}" || "$2" == --* ]]; then
-                echo "Error: --agents requires a comma-separated list of agent names" >&2
-                exit 1
-            fi
-            IFS=',' read -ra SELECTED_AGENTS <<< "$2"
-            shift 2
-            ;;
-        --all)
-            USE_ALL=true
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        *)
-            echo "Unknown flag: $1" >&2
-            exit 1
-            ;;
-    esac
-done
 
-# --all always wins, regardless of argument order
-if $USE_ALL; then
-    SELECTED_AGENTS=()
-fi
+def _escape_toml(s: str) -> str:
+    """Escape a string for TOML."""
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
-# Empty = all agents (backward-compatible default)
-if [[ ${#SELECTED_AGENTS[@]} -eq 0 ]]; then
-    SELECTED_AGENTS=("${ALL_AGENTS[@]}")
-fi
 
-# Deduplicate (preserving first-seen order)
-declare -A _seen
-DEDUPED=()
-for agent in "${SELECTED_AGENTS[@]}"; do
-    if [[ -z "${_seen[$agent]:-}" ]]; then
-        _seen[$agent]=1
-        DEDUPED+=("$agent")
-    fi
-done
-SELECTED_AGENTS=("${DEDUPED[@]}")
+def _toml_value(v) -> str:
+    """Format a Python value as a TOML value."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return f'"{_escape_toml(v)}"'
+    if isinstance(v, list):
+        items = ", ".join(_toml_value(i) for i in v)
+        return f"[{items}]"
+    return f'"{v}"'
 
-# Validate
-for agent in "${SELECTED_AGENTS[@]}"; do
-    if [[ -z "${AGENT_MACHINE[$agent]:-}" ]]; then
-        echo "Error: unknown agent '$agent'. Valid agents: ${ALL_AGENTS[*]}" >&2
-        exit 1
-    fi
-done
-if [[ ${#SELECTED_AGENTS[@]} -eq 0 ]]; then
-    echo "Error: no agents specified" >&2
-    exit 1
-fi
 
-echo "Selected agents (${#SELECTED_AGENTS[@]}): ${SELECTED_AGENTS[*]}"
+def _save_toml_from_dict(data: dict, path: Path) -> None:
+    """Write a dict back as TOML (minimal serializer since stdlib has no dump)."""
+    lines: list[str] = []
+    lines.append("# Soul Team Configuration")
+    lines.append(f"# Modified by soul-team on {_now()}")
+    lines.append("")
 
-# ── Dry-run mode: validate config, print roster, check files, exit ───────────
-if $DRY_RUN; then
-    echo ""
-    echo "=== DRY RUN: Config Validation ==="
-    echo ""
+    team = data.get("team", {})
+    if team:
+        lines.append("[team]")
+        for k, v in team.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
 
-    # Print agent roster with models and machines
-    echo "Agent Roster:"
-    printf "  %-14s %-10s %-12s\n" "NAME" "MODEL" "MACHINE"
-    printf "  %-14s %-10s %-12s\n" "-----------" "--------" "----------"
-    for agent in "${SELECTED_AGENTS[@]}"; do
-        agent_model=$(python3 -c "
-import re, sys
-txt = open(sys.argv[1]).read()
-agent = sys.argv[2]
-blocks = re.split(r'\[\[agents\]\]', txt)[1:]
-for b in blocks:
-    nm = re.search(r'name\s*=\s*\"(\w+)\"', b)
-    if nm and nm.group(1) == agent:
-        m = re.search(r'model\s*=\s*\"(\w+)\"', b)
-        print(m.group(1) if m else 'sonnet')
-        break
-else:
-    print('sonnet')
-" "$TOML" "$agent" 2>/dev/null)
-        printf "  %-14s %-10s %-12s\n" "$agent" "$agent_model" "${AGENT_MACHINE[$agent]}"
-    done
-    echo ""
+    policies = data.get("policies", {})
+    if policies:
+        lines.append("[policies]")
+        for k, v in policies.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
 
-    # Verify required files exist
-    errors=0
-    echo "File Checks:"
-    check_file() {
-        local label="$1" path="$2"
-        if [ -f "$path" ]; then
-            echo "  [OK]   $label: $path"
-        else
-            echo "  [FAIL] $label: $path (NOT FOUND)"
-            errors=$((errors + 1))
-        fi
-    }
+    machines = data.get("machines", [])
+    for m in machines:
+        lines.append("[[machines]]")
+        for k, v in m.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
 
-    check_file "TOML config" "$TOML"
-    check_file "CLAUDE.md (global)" "$HOME/.claude/CLAUDE.md"
-    check_file "CLAUDE-dev.md" "$HOME/.claude/CLAUDE-dev.md"
-    check_file "clawteam CLI" "$CLAWTEAM"
+    agents = data.get("agents", [])
+    for agent in agents:
+        lines.append("[[agents]]")
+        for k, v in agent.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
 
-    # Check agent role files
-    for agent in "${SELECTED_AGENTS[@]}"; do
-        role_file="$HOME/.claude/agents/${agent}.md"
-        if [ -f "$role_file" ]; then
-            echo "  [OK]   Agent role: $role_file"
-        else
-            echo "  [WARN] Agent role: $role_file (not found — may use inline)"
-        fi
-    done
-    echo ""
+    layout = data.get("layout", {})
+    if layout:
+        grid = layout.pop("grid", [])
+        lines.append("[layout]")
+        for k, v in layout.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
+        for g in grid:
+            lines.append("[[layout.grid]]")
+            for k, v in g.items():
+                lines.append(f'{k} = {_toml_value(v)}')
+            lines.append("")
 
-    # Check service unit files
-    echo "Service Units:"
-    for svc in soul-guardian soul-courier soul-router; do
-        unit_file="$HOME/.config/systemd/user/${svc}.service"
-        if [ -f "$unit_file" ]; then
-            echo "  [OK]   $svc.service"
-        else
-            echo "  [WARN] $svc.service (unit file not found at $unit_file)"
-        fi
-    done
-    echo ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _recalculate_layout(data: dict) -> None:
+    """Recalculate layout section based on current agents."""
+    agents = data.get("agents", [])
+    n = len(agents)
+    if n == 0:
+        data.pop("layout", None)
+        return
+    cols = 1 if n <= 3 else (2 if n <= 6 else 3)
+    rows = (n + cols - 1) // cols
+
+    columns: list[list[str]] = [[] for _ in range(cols)]
+    for i, agent in enumerate(agents):
+        columns[i % cols].append(agent.get("name", f"agent-{i}"))
+
+    grid = []
+    for c, col_agents in enumerate(columns):
+        grid.append({"col": c + 1, "agents": col_agents})
+
+    data["layout"] = {"columns": cols + 1, "rows": rows, "grid": grid}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STATE DETECTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def detect_state() -> tuple[str, dict | None]:
+    """Detect current state. Returns (state, config_data).
+
+    States: "first_run", "configured", "running"
+    """
+    config_path = _resolve_config_path()
+    config_exists = config_path.exists()
+    config_data = None
+
+    if config_exists:
+        try:
+            config_data = _load_toml(config_path)
+        except Exception:
+            config_data = None
+
+    if not config_exists or config_data is None:
+        return "first_run", None
+
+    # Check if a tmux session is running
+    team_name = config_data.get("team", {}).get("name", "soul-team")
+    session_running = subprocess.run(
+        ["tmux", "has-session", "-t", team_name],
+        capture_output=True,
+    ).returncode == 0
+
+    if session_running:
+        return "running", config_data
+    else:
+        return "configured", config_data
+
+
+def _get_session_uptime(team_name: str) -> str:
+    """Get how long the tmux session has been running."""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", team_name, "-p", "#{session_created}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            created = int(result.stdout.strip())
+            elapsed = int(time.time()) - created
+            hours = elapsed // 3600
+            minutes = (elapsed % 3600) // 60
+            if hours > 0:
+                return f"{hours}h {minutes}m"
+            return f"{minutes}m"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _count_running_agents(team_name: str) -> tuple[int, int]:
+    """Count (alive, total) agents by checking tmux panes."""
+    panes_json = HOME / ".clawteam" / "teams" / team_name / "panes.json"
+    if not panes_json.exists():
+        return 0, 0
+
+    try:
+        panes = json.loads(panes_json.read_text())
+    except Exception:
+        return 0, 0
+
+    total = 0
+    alive = 0
+    for agent_name, pane_id in panes.items():
+        if agent_name == "team-lead":
+            continue
+        total += 1
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-3"],
+                capture_output=True, text=True,
+            )
+            content = result.stdout.strip()
+            # If pane has content and not just a shell prompt, agent is alive
+            if content and not re.match(r'^[a-z]+@[a-zA-Z0-9-]+[^>]*\$\s*$', content):
+                alive += 1
+        except Exception:
+            pass
+
+    return alive, total
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEMPLATE & AGENT GENERATION (from soul-init)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def load_template(template_name: str) -> str:
+    path = TEMPLATES_DIR / f"{template_name}.md"
+    if not path.exists():
+        return ""
+    return path.read_text()
+
+
+def render_template(template_content: str, agent_name: str) -> str:
+    return template_content.replace("{{AGENT_NAME}}", agent_name.capitalize())
+
+
+def _get_template_model_default(template_name: Optional[str]) -> str:
+    if not template_name:
+        return "sonnet"
+    path = TEMPLATES_DIR / f"{template_name}.md"
+    if not path.exists():
+        return "sonnet"
+    try:
+        content = path.read_text()
+        m = re.search(r"model_default:\s*(\w+)", content)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return "sonnet"
+
+
+def generate_agent_md(agent: Agent) -> str:
+    if agent.template:
+        template = load_template(agent.template)
+        if template:
+            return render_template(template, agent.name)
+    return textwrap.dedent(f"""\
+        ---
+        name: {agent.name}
+        description: {agent.role}
+        ---
+
+        # {agent.name.capitalize()} Agent
+
+        You are **{agent.name.capitalize()}** -- {agent.role}.
+
+        ## Mandate
+
+        Execute tasks in your domain. Verify results before claiming done.
+        Check inbox at the start of every work cycle.
+
+        ## Communication Style
+
+        - Be concise and evidence-driven
+        - Lead with the answer, not the process
+        - Escalate blockers immediately to team lead
+
+        ## Daily Routine
+
+        1. Check inbox for new messages
+        2. Review open tasks
+        3. Work on highest-priority item
+        4. When idle: enter proactive mode
+
+        ## Shared Protocols
+
+        See team protocol file for: communication standards, escalation chain,
+        heartbeat protocol, task execution flow, and memory persistence.
+    """)
+
+
+def generate_toml(config: TeamConfig) -> str:
+    lines = []
+    lines.append("# Soul Team Configuration")
+    lines.append(f"# Generated by soul-team on {_now()}")
+    lines.append("")
+    lines.append("[team]")
+    lines.append(f'name = "{config.team_name}"')
+    lines.append(f'description = "AI agent team -- {len(config.agents)} agents"')
+    lines.append(f'boot_prompt = "{_escape_toml(config.boot_prompt)}"')
+    lines.append(f"stagger_seconds = {config.stagger_seconds}")
+    lines.append("")
+
+    lines.append("[policies]")
+    lines.append(f'permission_mode = "{config.permission_mode}"')
+    lines.append(f"agent_memory = {str(config.agent_memory).lower()}")
+    lines.append(f'communication = "{config.communication_protocol}"')
+    lines.append(f"guardian = {str(config.enable_guardian).lower()}")
+    lines.append(f"courier = {str(config.enable_courier).lower()}")
+    lines.append(f"idle_shutdown = {str(config.enable_idle_shutdown).lower()}")
+    if config.enable_idle_shutdown:
+        lines.append(f"idle_timeout_minutes = {config.idle_timeout_minutes}")
+    lines.append("")
+
+    if config.machines:
+        for m in config.machines:
+            lines.append("[[machines]]")
+            lines.append(f'name = "{m.name}"')
+            lines.append(f'ssh = "{m.ssh_target}"')
+            lines.append("")
+
+    local_agents = [a for a in config.agents if a.machine == "local"]
+    remote_agents = [a for a in config.agents if a.machine != "local"]
+
+    if local_agents:
+        lines.append("# --- Local agents ---")
+        lines.append("")
+    for agent in local_agents:
+        lines.append("[[agents]]")
+        lines.append(f'name = "{agent.name}"')
+        lines.append(f'model = "{agent.model}"')
+        lines.append(f'machine = "local"')
+        lines.append(f"cgroup = true")
+        if agent.template:
+            lines.append(f'template = "{agent.template}"')
+        lines.append("")
+
+    if remote_agents:
+        lines.append("# --- Remote agents ---")
+        lines.append("")
+    for agent in remote_agents:
+        machine_obj = next((m for m in config.machines if m.name == agent.machine), None)
+        ssh_target = machine_obj.ssh_target if machine_obj else "user@host"
+        lines.append("[[agents]]")
+        lines.append(f'name = "{agent.name}"')
+        lines.append(f'model = "{agent.model}"')
+        lines.append(f'machine = "{agent.machine}"')
+        lines.append(f'ssh = "{ssh_target}"')
+        lines.append(f"cgroup = false")
+        if agent.template:
+            lines.append(f'template = "{agent.template}"')
+        lines.append("")
+
+    lines.append("[layout]")
+    n = len(config.agents)
+    cols = 1 if n <= 3 else (2 if n <= 6 else 3)
+    rows = (n + cols - 1) // cols
+    lines.append(f"columns = {cols + 1}")
+    lines.append(f"rows = {rows}")
+    lines.append("")
+
+    columns: list[list[str]] = [[] for _ in range(cols)]
+    for i, agent in enumerate(config.agents):
+        columns[i % cols].append(agent.name)
+    for c, col_agents in enumerate(columns):
+        lines.append("[[layout.grid]]")
+        lines.append(f"col = {c + 1}")
+        agent_names = ", ".join(f'"{a}"' for a in col_agents)
+        lines.append(f"agents = [{agent_names}]")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def generate_team_protocol(config: TeamConfig) -> str:
+    if PROTOCOL_SRC.exists():
+        content = PROTOCOL_SRC.read_text()
+        content = content.replace("soul-team", config.team_name)
+        return content
+    return textwrap.dedent(f"""\
+        # Team Protocol -- {config.team_name}
+
+        ## Communication Standard
+
+        Every agent message must be crisp, concise, and precise.
+        Lead with action or answer. No preamble. No trailing summaries.
+
+        ## Task Execution Flow
+
+        1. Check inbox for new messages
+        2. Process highest-priority task
+        3. Update status on completion
+        4. Enter proactive mode when idle
+
+        ## Escalation Protocol
+
+        1. Can you solve it yourself? Do it.
+        2. Does a peer know? Ask them.
+        3. Still blocked? Escalate to team lead.
+    """)
+
+
+def test_ssh(target: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target, "echo ok"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0 and "ok" in result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def _has_systemd() -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "status"],
+            capture_output=True, timeout=5,
+        )
+        return result.returncode in (0, 3)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIG WRITING (generates all files from a TeamConfig)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def write_config(config: TeamConfig) -> list[str]:
+    """Write all generated files. Returns list of created file paths."""
+    created: list[str] = []
+
+    section_header("Generating Configuration")
+
+    # 1. TOML config
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    toml_content = generate_toml(config)
+    primary_toml = USER_CONFIG_DIR / "config.toml"
+    primary_toml.write_text(toml_content)
+    ok(f"Config: {primary_toml}")
+    created.append(str(primary_toml))
+
+    # Legacy compat
+    CLAUDE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    legacy_toml = CLAUDE_CONFIG_DIR / "soul-team.toml"
+    legacy_toml.write_text(toml_content)
+    created.append(str(legacy_toml))
+
+    # 2. Agent .md files
+    CLAUDE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    for agent in config.agents:
+        agent_path = CLAUDE_AGENTS_DIR / f"{agent.name}.md"
+        agent_content = generate_agent_md(agent)
+        agent_path.write_text(agent_content)
+        created.append(str(agent_path))
+    ok(f"Agent personas: {len(config.agents)} files")
+
+    # 3. Team protocol
+    protocol_dir = HOME / ".claude" / "protocols"
+    protocol_dir.mkdir(parents=True, exist_ok=True)
+    protocol_path = protocol_dir / "team-protocol.md"
+    protocol_content = generate_team_protocol(config)
+    protocol_path.write_text(protocol_content)
+    created.append(str(protocol_path))
+    ok(f"Protocol: {protocol_path}")
+
+    # 4. Runtime directories
+    runtime_dirs = [
+        HOME / ".soul", HOME / ".soul" / "preflight", HOME / ".soul" / "health",
+        HOME / ".clawteam" / "teams" / config.team_name,
+        HOME / ".clawteam" / "teams" / config.team_name / "inboxes",
+        HOME / ".clawteam" / "teams" / config.team_name / "broadcast",
+        HOME / ".clawteam" / "teams" / config.team_name / "discussions",
+        HOME / ".clawteam" / "teams" / config.team_name / "sidecar",
+        HOME / ".clawteam" / "teams" / config.team_name / "queue",
+        CLAUDE_LOGS_DIR,
+    ]
+    for d in runtime_dirs:
+        d.mkdir(parents=True, exist_ok=True)
+    ok(f"Runtime directories: {len(runtime_dirs)}")
+
+    # 5. Per-agent inbox directories
+    inbox_base = HOME / ".clawteam" / "teams" / config.team_name / "inboxes"
+    for agent in config.agents:
+        (inbox_base / f"{agent.name}_{agent.name}" / "archive").mkdir(parents=True, exist_ok=True)
+    (inbox_base / "team-lead_team-lead" / "archive").mkdir(parents=True, exist_ok=True)
+
+    # 6. Native Teams inbox files
+    native_inbox = HOME / ".claude" / "teams" / config.team_name / "inboxes"
+    native_inbox.mkdir(parents=True, exist_ok=True)
+    for agent in config.agents:
+        inbox_file = native_inbox / f"{agent.name}.json"
+        if not inbox_file.exists():
+            inbox_file.write_text("[]")
+    tl_file = native_inbox / "team-lead.json"
+    if not tl_file.exists():
+        tl_file.write_text("[]")
+    ok("Inbox files initialized")
+
+    # 7. Systemd services
+    systemd_user = HOME / ".config" / "systemd" / "user"
+    if SYSTEMD_SRC.exists() and _has_systemd():
+        systemd_user.mkdir(parents=True, exist_ok=True)
+        installed = 0
+        for svc_file in SYSTEMD_SRC.glob("*.service"):
+            dest = systemd_user / svc_file.name
+            shutil.copy2(svc_file, dest)
+            installed += 1
+        if installed > 0:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            ok(f"Systemd services: {installed}")
+            created.append(str(systemd_user))
+    else:
+        warn("systemd not available -- daemons will start manually")
+
+    return created
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIRST RUN: SETUP WIZARD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def flow_first_run(quick: bool = False, num_agents: int = 3) -> bool:
+    """First-run setup wizard. Returns True if user wants to launch after setup."""
+    print(f"  {DIM}Welcome! Let's set up your agent team.{NC}")
+    print()
+
+    if quick:
+        info(f"Quick start: creating {num_agents}-agent team with defaults...")
+        print()
+        config = _quick_start_config(num_agents)
+        write_config(config)
+        _print_roster(config)
+        return confirm("Launch now?")
+
+    # Ask: Quick or Custom?
+    choice = select_menu(
+        "How would you like to set up?",
+        [
+            "Quick  (3 agents, ready in 30 seconds)",
+            "Custom (choose agents, machines, rules)",
+        ],
+        default=0,
+    )
+
+    if choice == 0:
+        config = _quick_start_config(3)
+        write_config(config)
+        _print_roster(config)
+        return confirm("Launch now?")
+
+    # Full custom wizard
+    config = _custom_wizard()
+    write_config(config)
+    _print_roster(config)
+    return confirm("Launch now?")
+
+
+def _quick_start_config(num_agents: int) -> TeamConfig:
+    config = TeamConfig()
+    config.team_name = "my-team"
+    for i in range(num_agents):
+        template = AVAILABLE_TEMPLATES[i % len(AVAILABLE_TEMPLATES)]
+        name = template if i < len(AVAILABLE_TEMPLATES) else f"{template}{i + 1}"
+        model = _get_template_model_default(template)
+        config.agents.append(Agent(
+            name=name, role=TEMPLATE_DESCRIPTIONS.get(template, ""),
+            model=model, machine="local", template=template,
+        ))
+    return config
+
+
+def _custom_wizard() -> TeamConfig:
+    config = TeamConfig()
+
+    # Step 1: Deployment mode
+    section_header("Deployment")
+    idx = select_menu(
+        "How will you run your agents?",
+        ["Single machine (all agents run locally)",
+         "Distributed (agents across multiple machines via SSH)"],
+    )
+    config.deployment_mode = "single" if idx == 0 else "distributed"
+
+    # Step 2: Agents
+    section_header("Agents")
+    num_agents = number_input("How many agents?", default=3, min_val=1, max_val=20)
+
+    template_indices = multi_select(
+        f"Pick agent templates (pick {num_agents} or fewer):",
+        AVAILABLE_TEMPLATES,
+        [TEMPLATE_DESCRIPTIONS.get(t, "") for t in AVAILABLE_TEMPLATES],
+    )
+
+    selected_templates = [AVAILABLE_TEMPLATES[i] for i in template_indices]
+    if not selected_templates:
+        selected_templates = QUICK_START_TEMPLATES[:num_agents]
+        warn(f"No selection -- using defaults: {', '.join(selected_templates)}")
+
+    agents_list = []
+    for i in range(num_agents):
+        template = selected_templates[i % len(selected_templates)]
+        default_name = template if i < len(selected_templates) else f"{template}{i + 1}"
+        existing = [a.name for a in agents_list]
+        if default_name in existing:
+            suffix = 2
+            while f"{template}{suffix}" in existing:
+                suffix += 1
+            default_name = f"{template}{suffix}"
+
+        name = text_input(f"Agent {i + 1} name (template: {template})", default=default_name)
+
+        # Model selection
+        template_default = _get_template_model_default(template)
+        default_idx = MODEL_OPTIONS.index(template_default) if template_default in MODEL_OPTIONS else 1
+        midx = select_menu(
+            f"Model for {name}:",
+            ["opus (most capable, highest cost)", "sonnet (balanced)", "haiku (fastest, lowest cost)"],
+            default=default_idx,
+        )
+        model = MODEL_OPTIONS[midx]
+
+        machine = "local"
+        if config.deployment_mode == "distributed" and config.machines:
+            machine_names = ["local"] + [m.name for m in config.machines]
+            machine_idx = select_menu(f"Machine for {name}:", machine_names)
+            machine = machine_names[machine_idx]
+
+        agents_list.append(Agent(
+            name=name, role=TEMPLATE_DESCRIPTIONS.get(template, ""),
+            model=model, machine=machine, template=template,
+        ))
+
+    config.agents = agents_list
+
+    # Step 3: Machines (distributed only)
+    if config.deployment_mode == "distributed":
+        section_header("Remote Machines")
+        while True:
+            mname = text_input("Machine name (e.g. worker-1)")
+            ssh_target = text_input(f"SSH target for '{mname}' (user@host)")
+            verified = False
+            if confirm("Test SSH connection?", default=True):
+                print(f"    Testing {ssh_target}...", end=" ", flush=True)
+                if test_ssh(ssh_target):
+                    print(f"{GREEN}Connected{NC}")
+                    verified = True
+                else:
+                    print(f"{RED}Failed{NC}")
+            config.machines.append(Machine(name=mname, ssh_target=ssh_target, verified=verified))
+            if not confirm("Add another machine?", default=False):
+                break
+
+    # Step 4: Team rules
+    section_header("Team Rules")
+    config.team_name = text_input("Team name", default="my-team")
+    config.team_name = re.sub(r"[^a-zA-Z0-9_-]", "-", config.team_name).lower()
+    config.stagger_seconds = number_input("Stagger delay between launches (seconds)", default=10, min_val=0, max_val=120)
+    config.enable_guardian = confirm("Enable guardian watchdog?")
+    config.enable_courier = confirm("Enable courier messaging?")
+
+    # Step 5: Policies
+    section_header("Policies")
+    pidx = select_menu(
+        "Permission mode:",
+        ["bypassPermissions (autonomous)", "default (ask before actions)", "acceptEdits (edit files, ask for tools)"],
+    )
+    config.permission_mode = ["bypassPermissions", "default", "acceptEdits"][pidx]
+    config.agent_memory = confirm("Enable agent memory (persist across sessions)?")
+    cidx = select_menu(
+        "Communication protocol:",
+        ["Full (courier + router + broadcasts)", "Basic (file-based inbox only)", "None (independent)"],
+    )
+    config.communication_protocol = ["full", "basic", "none"][cidx]
+
+    return config
+
+
+def _print_roster(config: TeamConfig) -> None:
+    """Print agent roster summary."""
+    print()
+    info("Agent Roster:")
+    print(f"    {BOLD}{'NAME':<16} {'MODEL':<10} {'MACHINE':<12} {'TEMPLATE'}{NC}")
+    print(f"    {GRAY}{'─' * 15} {'─' * 9} {'─' * 11} {'─' * 12}{NC}")
+    for a in config.agents:
+        tmpl = a.template or "(custom)"
+        print(f"    {a.name:<16} {a.model:<10} {a.machine:<12} {tmpl}")
+    print()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIGURED STATE: LAUNCH / CONFIGURE MENU
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def flow_configured(data: dict) -> None:
+    """State 2: Config exists, no session running."""
+    team = data.get("team", {})
+    agents = data.get("agents", [])
+    team_name = team.get("name", "unnamed")
+
+    print(f"  {BOLD}Team:{NC} {team_name} ({len(agents)} agents)")
+    print()
+
+    while True:
+        choice = select_menu(
+            "What would you like to do?",
+            ["Launch team", "Configure", "Validate (dry-run)", "Exit"],
+        )
+
+        if choice == 0:
+            # Launch
+            _launch_team(data)
+            return
+        elif choice == 1:
+            _configure_menu(data)
+        elif choice == 2:
+            _dry_run(data)
+        elif choice == 3:
+            print()
+            print(f"  {DIM}Goodbye.{NC}")
+            return
+
+
+def _configure_menu(data: dict) -> None:
+    """Configuration sub-menu."""
+    while True:
+        choice = select_menu(
+            "What to configure?",
+            [
+                "Agents (add, remove, change model)",
+                "Machines (add, remove, test SSH)",
+                "Team rules (boot prompt, stagger, timeouts)",
+                "Policies (permissions, memory, communication)",
+                "View current config",
+            ],
+            back_option=True,
+        )
+
+        if choice == -1:
+            return
+        elif choice == 0:
+            _configure_agents(data)
+        elif choice == 1:
+            _configure_machines(data)
+        elif choice == 2:
+            _configure_rules(data)
+        elif choice == 3:
+            _configure_policies(data)
+        elif choice == 4:
+            _view_config(data)
+
+
+def _configure_agents(data: dict) -> None:
+    """Agent management sub-menu."""
+    config_path = _resolve_config_path()
+
+    while True:
+        agents = data.get("agents", [])
+        print()
+        info("Current agents:")
+        for i, a in enumerate(agents):
+            model = a.get("model", "sonnet")
+            machine = a.get("machine", "local")
+            print(f"    {i + 1}. {BOLD}{a['name']}{NC}  [{model}]  {machine}")
+        print()
+
+        choice = select_menu(
+            "What to do?",
+            ["Add agent", "Remove agent", "Change agent model", "Change agent machine"],
+            back_option=True,
+        )
+
+        if choice == -1:
+            return
+        elif choice == 0:
+            # Add agent from template
+            template_idx = select_menu(
+                "Choose a template:",
+                AVAILABLE_TEMPLATES + ["[custom]"],
+                [TEMPLATE_DESCRIPTIONS.get(t, "") for t in AVAILABLE_TEMPLATES] + ["Define from scratch"],
+            )
+
+            if template_idx == len(AVAILABLE_TEMPLATES):
+                # Custom agent
+                name = text_input("Agent name")
+                role = text_input("Agent role")
+                midx = select_menu("Model:", ["opus", "sonnet", "haiku"], default=1)
+                model = MODEL_OPTIONS[midx]
+                entry = {"name": name, "model": model, "machine": "local", "cgroup": True}
+            else:
+                template = AVAILABLE_TEMPLATES[template_idx]
+                existing_names = {a["name"] for a in agents}
+                name = template
+                suffix = 1
+                while name in existing_names:
+                    suffix += 1
+                    name = f"{template}-{suffix}"
+
+                model = _get_template_model_default(template)
+                entry = {"name": name, "model": model, "machine": "local", "cgroup": True, "template": template}
+
+                # Generate agent .md
+                agent_obj = Agent(name=name, role=TEMPLATE_DESCRIPTIONS.get(template, ""), model=model, template=template)
+                CLAUDE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+                (CLAUDE_AGENTS_DIR / f"{name}.md").write_text(generate_agent_md(agent_obj))
+
+            agents.append(entry)
+            _recalculate_layout(data)
+            _save_toml_from_dict(data, config_path)
+            ok(f"Added {entry['name']} [{entry['model']}]")
+
+        elif choice == 1:
+            # Remove agent
+            if not agents:
+                warn("No agents to remove.")
+                continue
+            names = [a["name"] for a in agents]
+            ridx = select_menu("Remove which agent?", names, back_option=True)
+            if ridx == -1:
+                continue
+            removed = names[ridx]
+            data["agents"] = [a for a in agents if a["name"] != removed]
+            _recalculate_layout(data)
+            _save_toml_from_dict(data, config_path)
+            agent_md = CLAUDE_AGENTS_DIR / f"{removed}.md"
+            if agent_md.exists():
+                agent_md.unlink()
+            ok(f"Removed {removed}")
+
+        elif choice == 2:
+            # Change model
+            if not agents:
+                warn("No agents configured.")
+                continue
+            names = [f"{a['name']} [{a.get('model', 'sonnet')}]" for a in agents]
+            aidx = select_menu("Change model for:", names, back_option=True)
+            if aidx == -1:
+                continue
+            midx = select_menu("New model:", ["opus", "sonnet", "haiku"])
+            agents[aidx]["model"] = MODEL_OPTIONS[midx]
+            _save_toml_from_dict(data, config_path)
+            ok(f"Set {agents[aidx]['name']} model to {MODEL_OPTIONS[midx]}")
+
+        elif choice == 3:
+            # Change machine
+            if not agents:
+                warn("No agents configured.")
+                continue
+            machines_data = data.get("machines", [])
+            machine_names = ["local"] + [m.get("name", "?") for m in machines_data]
+            if len(machine_names) == 1:
+                warn("Only local machine available. Add machines first.")
+                continue
+            names = [f"{a['name']} [{a.get('machine', 'local')}]" for a in agents]
+            aidx = select_menu("Change machine for:", names, back_option=True)
+            if aidx == -1:
+                continue
+            midx = select_menu("New machine:", machine_names)
+            agents[aidx]["machine"] = machine_names[midx]
+            agents[aidx]["cgroup"] = machine_names[midx] == "local"
+            _save_toml_from_dict(data, config_path)
+            ok(f"Set {agents[aidx]['name']} machine to {machine_names[midx]}")
+
+
+def _configure_machines(data: dict) -> None:
+    """Machine management sub-menu."""
+    config_path = _resolve_config_path()
+    machines = data.setdefault("machines", [])
+
+    while True:
+        print()
+        info("Machines:")
+        agents = data.get("agents", [])
+        agent_counts: dict[str, int] = {}
+        for a in agents:
+            m = a.get("machine", "local")
+            agent_counts[m] = agent_counts.get(m, 0) + 1
+
+        print(f"    {'local':<20} {'(this machine)':<25} {agent_counts.get('local', 0)} agents")
+        for m in machines:
+            name = m.get("name", "?")
+            ssh = m.get("ssh", "?")
+            print(f"    {name:<20} {ssh:<25} {agent_counts.get(name, 0)} agents")
+        print()
+
+        choice = select_menu(
+            "What to do?",
+            ["Add machine", "Remove machine", "Test SSH connectivity"],
+            back_option=True,
+        )
+
+        if choice == -1:
+            return
+        elif choice == 0:
+            name = text_input("Machine name (e.g. worker-1)")
+            ssh_target = text_input(f"SSH target for '{name}' (user@host)")
+            if confirm("Test SSH?", default=True):
+                print(f"    Testing {ssh_target}...", end=" ", flush=True)
+                if test_ssh(ssh_target):
+                    print(f"{GREEN}Connected{NC}")
+                else:
+                    print(f"{RED}Failed{NC}")
+            machines.append({"name": name, "ssh": ssh_target})
+            _save_toml_from_dict(data, config_path)
+            ok(f"Added machine '{name}'")
+
+        elif choice == 1:
+            if not machines:
+                warn("No remote machines to remove.")
+                continue
+            names = [m.get("name", "?") for m in machines]
+            ridx = select_menu("Remove which machine?", names, back_option=True)
+            if ridx == -1:
+                continue
+            removed = names[ridx]
+            data["machines"] = [m for m in machines if m.get("name") != removed]
+            machines = data["machines"]
+            _save_toml_from_dict(data, config_path)
+            ok(f"Removed machine '{removed}'")
+
+        elif choice == 2:
+            for m in machines:
+                name = m.get("name", "?")
+                ssh = m.get("ssh", "?")
+                print(f"    Testing {name} ({ssh})...", end=" ", flush=True)
+                if test_ssh(ssh):
+                    print(f"{GREEN}OK{NC}")
+                else:
+                    print(f"{RED}FAIL{NC}")
+
+
+def _configure_rules(data: dict) -> None:
+    """Edit team rules."""
+    config_path = _resolve_config_path()
+    team = data.setdefault("team", {})
+
+    section_header("Team Rules")
+    team["name"] = text_input("Team name", default=team.get("name", "my-team"))
+    team["boot_prompt"] = text_input("Boot prompt", default=team.get("boot_prompt", "Run your daily routine."))
+    team["stagger_seconds"] = number_input("Stagger delay (seconds)", default=team.get("stagger_seconds", 10), min_val=0, max_val=120)
+
+    policies = data.setdefault("policies", {})
+    policies["guardian"] = confirm("Enable guardian watchdog?", default=policies.get("guardian", True))
+    policies["courier"] = confirm("Enable courier messaging?", default=policies.get("courier", True))
+
+    _save_toml_from_dict(data, config_path)
+    ok("Rules updated")
+
+
+def _configure_policies(data: dict) -> None:
+    """Edit policies."""
+    config_path = _resolve_config_path()
+    policies = data.setdefault("policies", {})
+
+    section_header("Policies")
+    current_perm = policies.get("permission_mode", "bypassPermissions")
+    perm_opts = ["bypassPermissions", "default", "acceptEdits"]
+    default_idx = perm_opts.index(current_perm) if current_perm in perm_opts else 0
+    pidx = select_menu("Permission mode:", perm_opts, default=default_idx)
+    policies["permission_mode"] = perm_opts[pidx]
+
+    policies["agent_memory"] = confirm("Enable agent memory?", default=policies.get("agent_memory", True))
+
+    comm_opts = ["full", "basic", "none"]
+    current_comm = policies.get("communication", "full")
+    cidx_default = comm_opts.index(current_comm) if current_comm in comm_opts else 0
+    cidx = select_menu("Communication protocol:", comm_opts, default=cidx_default)
+    policies["communication"] = comm_opts[cidx]
+
+    _save_toml_from_dict(data, config_path)
+    ok("Policies updated")
+
+
+def _view_config(data: dict) -> None:
+    """Display current configuration."""
+    config_path = _resolve_config_path()
+    print()
+    info(f"Config: {config_path}")
+    print()
+
+    team = data.get("team", {})
+    if team:
+        print(f"  {CYAN}[team]{NC}")
+        for k, v in team.items():
+            print(f"    {k} = {v}")
+        print()
+
+    policies = data.get("policies", {})
+    if policies:
+        print(f"  {CYAN}[policies]{NC}")
+        for k, v in policies.items():
+            print(f"    {k} = {v}")
+        print()
+
+    agents = data.get("agents", [])
+    print(f"  {CYAN}Agents ({len(agents)}):{NC}")
+    for a in agents:
+        print(f"    {a.get('name', '?')} ({a.get('model', 'sonnet')}, {a.get('machine', 'local')})")
+    print()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RUNNING STATE: SESSION MANAGEMENT
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def flow_running(data: dict) -> None:
+    """State 3: Session is active."""
+    team = data.get("team", {})
+    agents = data.get("agents", [])
+    team_name = team.get("name", "soul-team")
+    uptime = _get_session_uptime(team_name)
+    alive, total = _count_running_agents(team_name)
+
+    print(f"  {BOLD}Team:{NC} {team_name} ({alive}/{total} agents running)")
+    print(f"  {BOLD}Session:{NC} {team_name} [{GREEN}active{NC} since {uptime} ago]")
+    print()
+
+    while True:
+        choice = select_menu(
+            "What would you like to do?",
+            [
+                "Attach to session",
+                "Health dashboard",
+                "Agent status board",
+                "Send message to agent",
+                "Restart dead agents",
+                "Stop session",
+                "Configure (for next launch)",
+                "Exit",
+            ],
+        )
+
+        if choice == 0:
+            _attach_session(team_name)
+            return
+        elif choice == 1:
+            _health_dashboard(team_name, data)
+        elif choice == 2:
+            _agent_status_board(team_name, data)
+        elif choice == 3:
+            _send_message(team_name, data)
+        elif choice == 4:
+            _restart_dead_agents(team_name, data)
+        elif choice == 5:
+            if confirm("Stop the entire session?", default=False):
+                _stop_session(team_name)
+                return
+        elif choice == 6:
+            _configure_menu(data)
+        elif choice == 7:
+            print()
+            print(f"  {DIM}Session still running. Use 'soul-team' to return.{NC}")
+            return
+
+
+def _attach_session(team_name: str) -> None:
+    """Attach to the running tmux session."""
+    print(f"  Attaching to {team_name}...")
+    os.execvp("tmux", ["tmux", "attach-session", "-t", team_name])
+
+
+def _health_dashboard(team_name: str, data: dict) -> None:
+    """Show health dashboard (refreshable)."""
+    while True:
+        # Gather health data
+        alive, total = _count_running_agents(team_name)
+
+        # Check services
+        services = {}
+        for svc in ["soul-guardian", "soul-courier", "soul-router"]:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", f"{svc}.service"],
+                capture_output=True, text=True,
+            )
+            services[svc.replace("soul-", "")] = result.stdout.strip() == "active"
+
+        # Memory estimate from heartbeat files
+        heartbeat_dir = HOME / ".clawteam" / "heartbeat"
+        memory_files = list(heartbeat_dir.glob("*.json")) if heartbeat_dir.exists() else []
+
+        # Event files
+        event_dir = HOME / ".clawteam" / "teams" / team_name / "queue"
+        event_count = len(list(event_dir.glob("*.json"))) if event_dir.exists() else 0
+
+        print()
+        print(f"  {BOLD}{BOX_H * 50}{NC}")
+        svc_str = "  ".join(status_dot(name, is_ok) for name, is_ok in services.items())
+        print(f"  {BOLD}SERVICES{NC}  {svc_str}")
+        agent_color = GREEN if alive == total else (YELLOW if alive > 0 else RED)
+        print(f"  {BOLD}AGENTS{NC}    {agent_color}{alive} running{NC}, {total - alive} down, {total} total")
+        print(f"  {BOLD}EVENTS{NC}    {event_count} queue files")
+        print(f"  {BOLD}{BOX_H * 50}{NC}")
+        print()
+
+        if not _supports_raw_mode():
+            input(f"  Press Enter to go back...")
+            return
+
+        print(f"  {DIM}Press q to go back, r to refresh{NC}")
+        _hide_cursor()
+        try:
+            key = _read_key()
+            if key == "q" or key == "escape":
+                # Clear the dashboard output
+                _clear_lines(9)
+                return
+            elif key == "r":
+                _clear_lines(9)
+                continue
+            elif key == "ctrl-c":
+                _show_cursor()
+                raise KeyboardInterrupt()
+            else:
+                _clear_lines(9)
+        finally:
+            _show_cursor()
+
+
+def _agent_status_board(team_name: str, data: dict) -> None:
+    """Show per-agent status."""
+    panes_json = HOME / ".clawteam" / "teams" / team_name / "panes.json"
+    if not panes_json.exists():
+        warn("No panes.json found. Session may not be tracked.")
+        return
+
+    try:
+        panes = json.loads(panes_json.read_text())
+    except Exception:
+        warn("Could not read panes.json")
+        return
+
+    agents = data.get("agents", [])
+    agent_info = {a.get("name", ""): a for a in agents}
+
+    print()
+    print(f"  {BOLD}{'AGENT':<16} {'MODEL':<10} {'MACHINE':<12} {'STATUS'}{NC}")
+    print(f"  {GRAY}{'─' * 15} {'─' * 9} {'─' * 11} {'─' * 10}{NC}")
+
+    for agent_name, pane_id in panes.items():
+        if agent_name == "team-lead":
+            continue
+
+        a = agent_info.get(agent_name, {})
+        model = a.get("model", "?")
+        machine = a.get("machine", "?")
+
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-3"],
+                capture_output=True, text=True,
+            )
+            content = result.stdout.strip()
+            if content and not re.match(r'^[a-z]+@[a-zA-Z0-9-]+[^>]*\$\s*$', content):
+                status = f"{GREEN}running{NC}"
+            else:
+                status = f"{RED}dead{NC}"
+        except Exception:
+            status = f"{YELLOW}unknown{NC}"
+
+        print(f"  {agent_name:<16} {model:<10} {machine:<12} {status}")
+
+    print()
+
+
+def _send_message(team_name: str, data: dict) -> None:
+    """Send a message to an agent."""
+    agents = data.get("agents", [])
+    names = [a.get("name", "?") for a in agents] + ["team-lead"]
+
+    idx = select_menu("Send message to:", names, back_option=True)
+    if idx == -1:
+        return
+
+    target = names[idx]
+    msg = text_input("Message")
+    if not msg:
+        return
+
+    # Use clawteam CLI
+    clawteam = HOME / ".local" / "bin" / "clawteam"
+    if clawteam.exists():
+        result = subprocess.run(
+            [str(clawteam), "inbox", "send", team_name, target, msg, "--from", "team-lead"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            ok(f"Message sent to {target}")
+        else:
+            fail(f"Failed to send: {result.stderr.strip()}")
+    else:
+        warn("clawteam CLI not found -- message not sent.")
+
+
+def _restart_dead_agents(team_name: str, data: dict) -> None:
+    """Restart agents that have died."""
+    panes_json = HOME / ".clawteam" / "teams" / team_name / "panes.json"
+    if not panes_json.exists():
+        warn("No panes.json found.")
+        return
+
+    try:
+        panes = json.loads(panes_json.read_text())
+    except Exception:
+        warn("Could not read panes.json")
+        return
+
+    agents = data.get("agents", [])
+    agent_info = {a.get("name", ""): a for a in agents}
+    dev_agents = {"shuri", "happy"}
+    c_cmd = "claude --permission-mode bypassPermissions"
+
+    revived = 0
+    for agent_name, pane_id in panes.items():
+        if agent_name == "team-lead":
+            continue
+
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-5"],
+                capture_output=True, text=True,
+            )
+            content = result.stdout.strip()
+
+            if not content or re.match(r'^[a-z]+@[a-zA-Z0-9-]+[^>]*\$\s*$', content):
+                a = agent_info.get(agent_name, {})
+                model = a.get("model", "sonnet")
+                machine = a.get("machine", "local")
+
+                dev_flag = ""
+                if agent_name in dev_agents:
+                    dev_flag = f"--append-system-prompt-file {HOME}/.claude/CLAUDE-dev.md"
+
+                if machine == "local":
+                    launch_cmd = (
+                        f"export SOUL_AGENT_NAME={agent_name} SOUL_TEAM_NAME={team_name} && "
+                        f"systemd-run --user --slice=soul-agents.slice --scope "
+                        f"{c_cmd} --agent {agent_name} {dev_flag}"
+                    )
+                else:
+                    ssh_target = a.get("ssh", "")
+                    if not ssh_target:
+                        for m in data.get("machines", []):
+                            if m.get("name") == machine:
+                                ssh_target = m.get("ssh", "")
+                                break
+                    launch_cmd = (
+                        f"ssh -t {ssh_target} "
+                        f"'export SOUL_AGENT_NAME={agent_name} SOUL_TEAM_NAME={team_name} && "
+                        f"{c_cmd} --agent {agent_name} {dev_flag}'"
+                    )
+
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, launch_cmd, "Enter"])
+                ok(f"Reviving {agent_name}")
+                revived += 1
+        except Exception:
+            warn(f"Could not check {agent_name}")
+
+    if revived == 0:
+        ok("All agents are alive.")
+    else:
+        ok(f"Revived {revived} agent(s)")
+
+
+def _stop_session(team_name: str) -> None:
+    """Stop the running session."""
+    print(f"  Stopping {team_name}...")
+
+    # Kill sidecars
+    subprocess.run(["pkill", "-f", "soul-sidecar"], capture_output=True)
+
+    # Stop services
+    for svc in ["soul-courier", "soul-router", "soul-guardian"]:
+        subprocess.run(["systemctl", "--user", "stop", f"{svc}.service"], capture_output=True)
+
+    # Kill tmux session
+    subprocess.run(["tmux", "kill-session", "-t", team_name], capture_output=True)
+
+    ok(f"Session '{team_name}' stopped.")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LAUNCH TEAM (the core bash logic, ported to Python)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _launch_team(data: dict, selected_agents: list[str] | None = None) -> None:
+    """Launch the agent team in tmux. This is the main event."""
+    team = data.get("team", {})
+    agents = data.get("agents", [])
+    team_name = team.get("name", "soul-team")
+    boot_prompt = team.get("boot_prompt", "Run your daily routine then enter proactive mode when idle.")
+    stagger = team.get("stagger_seconds", 10)
+    dev_agents = {"shuri", "happy"}
+    c_cmd = "claude --permission-mode bypassPermissions"
+    clawteam = HOME / ".local" / "bin" / "clawteam"
+    panes_json_path = HOME / ".clawteam" / "teams" / team_name / "panes.json"
+
+    # Build agent list
+    all_agents = [a.get("name", "") for a in agents]
+    agent_machines = {a.get("name", ""): a.get("machine", "local") for a in agents}
+    agent_ssh = {}
+    for a in agents:
+        if a.get("ssh"):
+            agent_ssh[a["name"]] = a["ssh"]
+        elif a.get("machine", "local") != "local":
+            for m in data.get("machines", []):
+                if m.get("name") == a.get("machine"):
+                    agent_ssh[a["name"]] = m.get("ssh", "")
+    agent_models = {a.get("name", ""): a.get("model", "sonnet") for a in agents}
+
+    if selected_agents:
+        # Validate
+        for a in selected_agents:
+            if a not in agent_machines:
+                fail(f"Unknown agent '{a}'. Valid: {', '.join(all_agents)}")
+                return
+        launch_agents = selected_agents
+    else:
+        launch_agents = all_agents
+
+    if not launch_agents:
+        fail("No agents to launch.")
+        return
+
+    num = len(launch_agents)
+    info(f"Launching {num} agents with {stagger}s stagger...")
+    print()
+
+    # ── ClawTeam init ──
+    if clawteam.exists():
+        subprocess.run([str(clawteam), "team", "spawn-team", team_name], capture_output=True)
+
+    # ── Native inbox dirs ──
+    native_inbox = HOME / ".claude" / "teams" / team_name / "inboxes"
+    native_inbox.mkdir(parents=True, exist_ok=True)
+    for agent_name in all_agents + ["team-lead"]:
+        inbox_file = native_inbox / f"{agent_name}.json"
+        if not inbox_file.exists():
+            inbox_file.write_text("[]")
+
+    # ── ClawTeam comms dirs ──
+    for subdir in ["queue", "broadcast", "discussions", "sidecar"]:
+        (HOME / ".clawteam" / "teams" / team_name / subdir).mkdir(parents=True, exist_ok=True)
+    for agent_name in all_agents + ["team-lead"]:
+        (HOME / ".clawteam" / "teams" / team_name / "inboxes" / f"{agent_name}_{agent_name}" / "archive").mkdir(parents=True, exist_ok=True)
+    (HOME / ".clawteam" / "heartbeat").mkdir(parents=True, exist_ok=True)
+
+    # ── SSH pre-flight (only if remote agents selected) ──
+    needs_remote = any(agent_machines.get(a, "local") != "local" for a in launch_agents)
+    if needs_remote:
+        pc_ssh = None
+        for a in launch_agents:
+            if agent_machines.get(a, "local") != "local":
+                pc_ssh = agent_ssh.get(a)
+                break
+        if pc_ssh:
+            print(f"  Checking remote mount on {pc_ssh}...")
+            subprocess.run(
+                ["ssh", pc_ssh, "sudo systemctl start soul-mounts.service 2>/dev/null"],
+                capture_output=True,
+            )
+
+    # ── Cleanup stale ──
+    subprocess.run(["pkill", "-f", "soul-sidecar.sh"], capture_output=True)
+    subprocess.run(["pkill", "-f", "soul-sidecar-wrapper.sh"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "stop", "soul-courier.service"], capture_output=True)
+    subprocess.run(["pkill", "-f", "soul-bridge.py"], capture_output=True)
+    subprocess.run(["tmux", "kill-session", "-t", team_name], capture_output=True)
+
+    # Clear sidecar state
+    sidecar_dir = HOME / ".clawteam" / "teams" / team_name / "sidecar"
+    for f in sidecar_dir.glob("*-seen.log"):
+        f.unlink(missing_ok=True)
+    for f in sidecar_dir.glob("*-interrupt.lock"):
+        f.unlink(missing_ok=True)
+    queue_dir = HOME / ".clawteam" / "teams" / team_name / "queue"
+    for f in queue_dir.glob("*.json"):
+        f.write_text("[]")
+
+    # ── Create tmux layout ──
+    cols = 1 if num <= 3 else (2 if num <= 6 else 3)
+
+    subprocess.run(["tmux", "new-session", "-d", "-s", team_name, "-n", "soul"], check=True)
+    ceo_pane = subprocess.run(
+        ["tmux", "display-message", "-t", team_name, "-p", "#{pane_id}"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    # Horizontal splits
+    h_splits = {1: [75], 2: [75, 50], 3: [75, 66, 50]}
+    col_panes = []
+    last_pane = ceo_pane
+    for c in range(cols):
+        subprocess.run(
+            ["tmux", "split-window", "-h", "-t", last_pane, "-l", f"{h_splits[cols][c]}%"],
+            check=True,
+        )
+        new_pane = subprocess.run(
+            ["tmux", "display-message", "-t", team_name, "-p", "#{pane_id}"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        col_panes.append(new_pane)
+        last_pane = new_pane
+
+    # Round-robin agents to columns
+    col_agents: list[list[str]] = [[] for _ in range(cols)]
+    for i, agent_name in enumerate(launch_agents):
+        col_agents[i % cols].append(agent_name)
+
+    pane_map: dict[str, str] = {}
+
+    for c in range(cols):
+        agents_in_col = col_agents[c]
+        n_rows = len(agents_in_col)
+        row_panes = [col_panes[c]]
+
+        if n_rows == 2:
+            subprocess.run(["tmux", "split-window", "-v", "-t", col_panes[c], "-l", "50%"])
+            new_pane = subprocess.run(
+                ["tmux", "display-message", "-t", team_name, "-p", "#{pane_id}"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            row_panes.append(new_pane)
+        elif n_rows == 3:
+            result = subprocess.run(
+                ["tmux", "split-window", "-v", "-t", col_panes[c], "-l", "66%", "-P", "-F", "#{pane_id}"],
+                capture_output=True, text=True,
+            )
+            mid = result.stdout.strip()
+            subprocess.run(["tmux", "split-window", "-v", "-t", mid, "-l", "50%"])
+            bot = subprocess.run(
+                ["tmux", "display-message", "-t", team_name, "-p", "#{pane_id}"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            row_panes.append(mid)
+            row_panes.append(bot)
+
+        for r in range(n_rows):
+            agent_name = agents_in_col[r]
+            pane_map[agent_name] = row_panes[r]
+            title = agent_name.capitalize()
+            if agent_machines.get(agent_name, "local") != "local":
+                title += "*"
+            subprocess.run(["tmux", "select-pane", "-t", row_panes[r], "-T", title])
+
+    subprocess.run(["tmux", "select-pane", "-t", ceo_pane, "-T", "CEO"])
+
+    # ── tmux styling ──
+    for opt, val in [
+        ("pane-border-status", "top"),
+        ("pane-border-format", " #{pane_title} "),
+        ("pane-active-border-style", "fg=#e8a849"),
+        ("pane-border-style", "fg=#444444"),
+        ("mouse", "on"),
+        ("status", "off"),
+    ]:
+        subprocess.run(["tmux", "set-option", "-t", team_name, opt, val])
+
+    # ── Write panes.json ──
+    panes_data = {"team-lead": ceo_pane}
+    panes_data.update(pane_map)
+    panes_json_path.parent.mkdir(parents=True, exist_ok=True)
+    panes_json_path.write_text(json.dumps(panes_data, indent=2))
+
+    # ── Launch CEO ──
+    time.sleep(1)
+    subprocess.run([
+        "tmux", "send-keys", "-t", ceo_pane,
+        f"export SOUL_AGENT_NAME=team-lead SOUL_TEAM_NAME={team_name} && {c_cmd}",
+        "Enter",
+    ])
+    subprocess.run(["tmux", "select-pane", "-t", ceo_pane])
+
+    ok(f"CEO ready. {num} agents launching with {stagger}s stagger...")
+
+    # ── Background: launch agents + services ──
+    # Fork a subprocess so we can attach immediately
+    pid = os.fork()
+    if pid == 0:
+        # Child process: launch agents
+        try:
+            # Run preflight
+            preflight = REPO_ROOT / "ops" / "agent-preflight.sh"
+            if preflight.exists():
+                subprocess.run(["bash", str(preflight), "--all"], capture_output=True)
+
+            time.sleep(3)
+
+            for agent_name in launch_agents:
+                pane_id = pane_map[agent_name]
+                machine = agent_machines.get(agent_name, "local")
+                model = agent_models.get(agent_name, "sonnet")
+                dev_flag = ""
+                if agent_name in dev_agents:
+                    dev_flag = f"--append-system-prompt-file {HOME}/.claude/CLAUDE-dev.md"
+
+                if machine == "local":
+                    cmd = (
+                        f"export SOUL_AGENT_NAME={agent_name} SOUL_TEAM_NAME={team_name} && "
+                        f"systemd-run --user --slice=soul-agents.slice --scope "
+                        f"{c_cmd} --agent {agent_name} {dev_flag}"
+                    )
+                else:
+                    ssh_target = agent_ssh.get(agent_name, "")
+                    cmd = (
+                        f"ssh -t {ssh_target} "
+                        f"'export SOUL_AGENT_NAME={agent_name} SOUL_TEAM_NAME={team_name} && "
+                        f"{c_cmd} --agent {agent_name} {dev_flag}'"
+                    )
+
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, cmd, "Enter"])
+                # Wait for trust prompt / TUI
+                time.sleep(8)
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, "", "Enter"])
+                time.sleep(5)
+
+                # Type boot prompt with time context
+                time_ctx = _get_soul_time()
+                agent_boot = (
+                    f"{time_ctx} {boot_prompt} "
+                    f"(You are {agent_name}. Your preflight data is at "
+                    f"~/.soul/preflight/{agent_name}.txt -- read it instead of running individual checks. "
+                    f"Then run: clawteam inbox receive {team_name} --agent {agent_name})"
+                )
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, agent_boot, "Enter"])
+                time.sleep(stagger)
+
+            # Start services
+            CLAUDE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
+            for svc in ["soul-router", "soul-courier", "soul-guardian"]:
+                subprocess.run(["systemctl", "--user", "start", f"{svc}.service"], capture_output=True)
+
+            # Heartbeat
+            heartbeat = REPO_ROOT / "ops" / "soul-heartbeat.sh"
+            if heartbeat.exists():
+                log_file = open(CLAUDE_LOGS_DIR / "soul-heartbeat.log", "a")
+                subprocess.Popen(["bash", str(heartbeat)], stdout=log_file, stderr=log_file)
+
+            # Time beacon
+            beacon = REPO_ROOT / "ops" / "soul-time-beacon.sh"
+            if beacon.exists():
+                log_file = open(CLAUDE_LOGS_DIR / "soul-time-beacon.log", "a")
+                subprocess.Popen(["bash", str(beacon)], stdout=log_file, stderr=log_file)
+
+        except Exception:
+            pass
+        finally:
+            os._exit(0)
+
+    # Parent: attach to tmux
+    os.execvp("tmux", ["tmux", "attach-session", "-t", team_name])
+
+
+def _get_soul_time() -> str:
+    """Generate time context string for agent boot prompts."""
+    from datetime import datetime
+    try:
+        # Use IST
+        tz_result = subprocess.run(
+            ["date", "+%Y-%m-%dT%H:%M:%S+05:30"],
+            capture_output=True, text=True, env={**os.environ, "TZ": "Asia/Kolkata"},
+        )
+        iso_time = tz_result.stdout.strip()
+        date_result = subprocess.run(
+            ["date", "+%Y-%m-%d %A %H:%M %H %V %u"],
+            capture_output=True, text=True, env={**os.environ, "TZ": "Asia/Kolkata"},
+        )
+        parts = date_result.stdout.strip().split()
+        if len(parts) >= 6:
+            date_str, day, time_str, hour_str, week, dow = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+            hour = int(hour_str)
+            mode = "NIGHT"
+            if 6 <= hour < 11:
+                mode = "MORNING"
+            elif 11 <= hour < 17:
+                mode = "AFTERNOON"
+            elif 17 <= hour < 22:
+                mode = "EVENING"
+            return (
+                f"[SOUL-TIME] datetime: {iso_time} date: {date_str} "
+                f"day: {day} time: {time_str} IST mode: {mode} "
+                f"week_number: {week} day_of_week: {dow} [/SOUL-TIME]"
+            )
+    except Exception:
+        pass
+    return f"[SOUL-TIME] datetime: {datetime.now().isoformat()} [/SOUL-TIME]"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DRY RUN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _dry_run(data: dict, selected_agents: list[str] | None = None) -> None:
+    """Validate configuration without launching."""
+    agents = data.get("agents", [])
+    config_path = _resolve_config_path()
+
+    if selected_agents:
+        all_names = {a.get("name", "") for a in agents}
+        for s in selected_agents:
+            if s not in all_names:
+                fail(f"Unknown agent '{s}'. Valid: {', '.join(sorted(all_names))}")
+                return
+        display_agents = [a for a in agents if a.get("name") in selected_agents]
+    else:
+        display_agents = agents
+
+    print()
+    info("DRY RUN: Config Validation")
+    print()
+
+    # Roster
+    info("Agent Roster:")
+    print(f"  {BOLD}{'NAME':<16} {'MODEL':<10} {'MACHINE':<12}{NC}")
+    print(f"  {GRAY}{'─' * 15} {'─' * 9} {'─' * 11}{NC}")
+    for a in display_agents:
+        print(f"  {a.get('name', '?'):<16} {a.get('model', 'sonnet'):<10} {a.get('machine', 'local'):<12}")
+    print()
+
+    # File checks
+    errors = 0
+    info("File Checks:")
+    checks = [
+        ("TOML config", config_path),
+        ("CLAUDE.md (global)", HOME / ".claude" / "CLAUDE.md"),
+        ("CLAUDE-dev.md", HOME / ".claude" / "CLAUDE-dev.md"),
+        ("clawteam CLI", HOME / ".local" / "bin" / "clawteam"),
+    ]
+    for label, path in checks:
+        if path.exists():
+            print(f"  {GREEN}[OK]{NC}   {label}: {path}")
+        else:
+            print(f"  {RED}[FAIL]{NC} {label}: {path}")
+            errors += 1
+
+    for a in display_agents:
+        role_file = HOME / ".claude" / "agents" / f"{a.get('name', '')}.md"
+        if role_file.exists():
+            print(f"  {GREEN}[OK]{NC}   Agent role: {role_file}")
+        else:
+            print(f"  {YELLOW}[WARN]{NC} Agent role: {role_file} (not found)")
+    print()
+
+    # Services
+    info("Service Units:")
+    for svc in ["soul-guardian", "soul-courier", "soul-router"]:
+        unit = HOME / ".config" / "systemd" / "user" / f"{svc}.service"
+        if unit.exists():
+            print(f"  {GREEN}[OK]{NC}   {svc}.service")
+        else:
+            print(f"  {YELLOW}[WARN]{NC} {svc}.service (not found at {unit})")
+    print()
 
     # Summary
-    remote_count=0
-    local_count=0
-    for agent in "${SELECTED_AGENTS[@]}"; do
-        if [[ "${AGENT_MACHINE[$agent]}" == "local" ]]; then
-            local_count=$((local_count + 1))
-        else
-            remote_count=$((remote_count + 1))
-        fi
-    done
-    echo "Summary:"
-    echo "  Total agents: ${#SELECTED_AGENTS[@]} (local: $local_count, remote: $remote_count)"
-    echo "  Stagger delay: ${DELAY}s"
-    echo "  Boot prompt: ${BOOT:0:60}..."
-    if [ "$errors" -gt 0 ]; then
-        echo ""
-        echo "  ERRORS: $errors required file(s) missing. Fix before launching."
-        exit 1
-    else
-        echo ""
-        echo "  All checks passed. Safe to launch."
-        exit 0
-    fi
-fi
+    local_count = sum(1 for a in display_agents if a.get("machine", "local") == "local")
+    remote_count = len(display_agents) - local_count
+    info("Summary:")
+    print(f"  Total agents: {len(display_agents)} (local: {local_count}, remote: {remote_count})")
+    stagger = data.get("team", {}).get("stagger_seconds", 10)
+    boot = data.get("team", {}).get("boot_prompt", "")
+    print(f"  Stagger delay: {stagger}s")
+    print(f"  Boot prompt: {boot[:60]}...")
+    print()
 
-# ── Dynamic layout function ──────────────────────────────────────────────────
-# PANE_MAP and CEO are declared at top level so they're accessible after the function returns.
-declare -A PANE_MAP
-CEO=""
+    if errors > 0:
+        fail(f"{errors} required file(s) missing. Fix before launching.")
+    else:
+        ok("All checks passed. Safe to launch.")
 
-create_dynamic_layout() {
-    local num=${#SELECTED_AGENTS[@]}
-    local cols
 
-    if   (( num <= 3 )); then cols=1
-    elif (( num <= 6 )); then cols=2
-    else                       cols=3
-    fi
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONTINUE MODE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    # Clean up any stale processes/sessions from previous launches
-    cleanup_stale
+def _continue_session(data: dict) -> None:
+    """Reattach + heal + revive dead agents."""
+    team_name = data.get("team", {}).get("name", "soul-team")
 
-    # Create session — initial pane becomes CEO
-    tmux new-session -d -s "$SESSION" -n "soul"
-    CEO=$(tmux display-message -t "$SESSION" -p '#{pane_id}')
+    if subprocess.run(["tmux", "has-session", "-t", team_name], capture_output=True).returncode != 0:
+        fail(f"No {team_name} session found. Run 'soul-team' to start fresh.")
+        sys.exit(1)
 
-    # Horizontal splits: CEO keeps 25%, agents get 75%
-    # shellcheck disable=SC2034  # H_SPLITS_* are accessed via indirect expansion below
-    local -a H_SPLITS_1=(75)
-    # shellcheck disable=SC2034
-    local -a H_SPLITS_2=(75 50)
-    # shellcheck disable=SC2034
-    local -a H_SPLITS_3=(75 66 50)
+    print(f"  Continuing {team_name} session...")
 
-    local -a col_panes=()
-    local splits_ref="H_SPLITS_${cols}[@]"
-    local -a splits=("${!splits_ref}")
+    # Heal services
+    subprocess.run(["systemctl", "--user", "restart", "soul-courier.service"], capture_output=True)
 
-    local last_pane="$CEO"
-    for (( c=0; c<cols; c++ )); do
-        tmux split-window -h -t "$last_pane" -l "${splits[c]}%"
-        col_panes[c]=$(tmux display-message -t "$SESSION" -p '#{pane_id}')
-        last_pane="${col_panes[c]}"
-    done
+    # Check router
+    router_running = subprocess.run(["pgrep", "-f", "soul-router.py"], capture_output=True).returncode == 0
+    if not router_running:
+        router_script = REPO_ROOT / "router" / "router.py"
+        if router_script.exists():
+            CLAUDE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            log_file = open(CLAUDE_LOGS_DIR / "soul-router.log", "a")
+            subprocess.Popen(["python3", str(router_script)], stdout=log_file, stderr=log_file)
+            ok("Router restarted")
 
-    # Round-robin assign agents to columns
-    local -a col_agents=()
-    for (( c=0; c<cols; c++ )); do col_agents[c]=""; done
-    for (( i=0; i<num; i++ )); do
-        local c_idx=$(( i % cols ))
-        col_agents[c_idx]+="${SELECTED_AGENTS[i]} "
-    done
+    # Revive dead agents
+    _restart_dead_agents(team_name, data)
 
-    # Vertical splits within each column
-    for (( c=0; c<cols; c++ )); do
-        local -a agents_in_col=()
-        read -ra agents_in_col <<< "${col_agents[$c]}"
-        local n_rows=${#agents_in_col[@]}
-        local -a row_panes=("${col_panes[$c]}")
+    # Attach
+    os.execvp("tmux", ["tmux", "attach-session", "-t", team_name])
 
-        if (( n_rows == 2 )); then
-            tmux split-window -v -t "${col_panes[$c]}" -l '50%'
-            row_panes+=("$(tmux display-message -t "$SESSION" -p '#{pane_id}')")
-        elif (( n_rows == 3 )); then
-            local mid
-            mid=$(tmux split-window -v -t "${col_panes[$c]}" -l '66%' -P -F '#{pane_id}')
-            tmux split-window -v -t "$mid" -l '50%'
-            local bot
-            bot=$(tmux display-message -t "$SESSION" -p '#{pane_id}')
-            row_panes+=("$mid" "$bot")
-        fi
 
-        for (( r=0; r<n_rows; r++ )); do
-            PANE_MAP["${agents_in_col[$r]}"]="${row_panes[$r]}"
-            local title="${agents_in_col[$r]^}"
-            if [[ "${AGENT_MACHINE[${agents_in_col[$r]}]}" != "local" ]]; then
-                title+="*"
-            fi
-            tmux select-pane -t "${row_panes[$r]}" -T "$title"
-        done
-    done
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MANAGEMENT SUBCOMMANDS (backward compat, called from menus or CLI)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    tmux select-pane -t "$CEO" -T "CEO"
-}
+def cmd_add_agent(args) -> None:
+    """Add an agent from a template or interactively."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team' first.")
+        sys.exit(1)
 
-# ── ClawTeam: init team if not present ─────────────────────────────────────
-echo "Initializing ClawTeam team..."
-"$CLAWTEAM" team spawn-team soul-team 2>/dev/null || true
+    data = _load_toml(config_path)
+    agents = data.setdefault("agents", [])
+    existing_names = {a["name"] for a in agents}
 
-# ── Native Teams inbox dir + per-agent inbox files ─────────────────────────
-NATIVE_INBOX_DIR="$HOME/.claude/teams/soul-team/inboxes"
-mkdir -p "$NATIVE_INBOX_DIR"
-for agent in happy xavier hawkeye pepper fury loki shuri stark banner team-lead; do
-    inbox_file="$NATIVE_INBOX_DIR/${agent}.json"
-    [ -f "$inbox_file" ] || echo '[]' > "$inbox_file"
-done
-echo "Native inbox files initialized."
+    if args.custom:
+        name = text_input("Agent name")
+        if name in existing_names:
+            fail(f"Agent '{name}' already exists.")
+            sys.exit(1)
+        role = text_input("Agent role (one-line description)")
 
-# ── ClawTeam inboxes dir + live comms directories ───────────────────────────
-mkdir -p "$HOME/.clawteam/teams/soul-team/inboxes"
-mkdir -p "$HOME/.clawteam/heartbeat"
+        # Model selection
+        midx = select_menu("Model:", [
+            "opus (most capable, highest cost)",
+            "sonnet (balanced capability and speed)",
+            "haiku (fastest, lowest cost)",
+        ], default=1)
+        model = MODEL_OPTIONS[midx]
 
-# ── Create live comms directories (queue, broadcast, discussions, sidecar) ───
-echo "Creating live comms directories..."
-mkdir -p "$HOME/.clawteam/teams/soul-team/"{queue,broadcast,discussions,sidecar}
-for agent in team-lead happy xavier hawkeye pepper fury loki shuri stark banner; do
-    mkdir -p "$HOME/.clawteam/teams/soul-team/inboxes/${agent}_${agent}/archive"
-done
-echo "Live comms directories ready."
+        machine = text_input("Machine", default="local")
+        template_name = None
+        if confirm("Base on a template?", default=True):
+            tidx = select_menu(
+                "Which template?",
+                [f"{t} -- {TEMPLATE_DESCRIPTIONS[t]}" for t in AVAILABLE_TEMPLATES],
+            )
+            template_name = AVAILABLE_TEMPLATES[tidx]
 
-# ── Conditional pre-flight (only SSH if remote agents selected) ──────────────
-NEEDS_REMOTE=false
-for agent in "${SELECTED_AGENTS[@]}"; do
-    if [[ "${AGENT_MACHINE[$agent]}" != "local" ]]; then
-        NEEDS_REMOTE=true
-        break
-    fi
-done
+        agent_entry = {"name": name, "model": model, "machine": machine, "cgroup": machine == "local"}
+        if template_name:
+            agent_entry["template"] = template_name
+    else:
+        template_name = args.template
+        if template_name not in AVAILABLE_TEMPLATES:
+            available = ", ".join(AVAILABLE_TEMPLATES)
+            fail(f"Unknown template '{template_name}'. Available: {available}")
+            sys.exit(1)
 
-if $NEEDS_REMOTE; then
-    echo "Checking titan-pc mounts..."
-    ssh "$PC" "sudo systemctl start soul-mounts.service 2>/dev/null" || true
-else
-    echo "All agents are local — skipping titan-pc pre-flight."
-fi
-tmux has-session -t "$SESSION" 2>/dev/null && tmux kill-session -t "$SESSION"
+        base_name = template_name
+        name = base_name
+        suffix = 1
+        while name in existing_names:
+            suffix += 1
+            name = f"{base_name}-{suffix}"
 
-# ── Create dynamic layout ────────────────────────────────────────────────────
-echo "Creating layout (${#SELECTED_AGENTS[@]} agents)..."
-create_dynamic_layout
+        model = _get_template_model_default(template_name)
+        agent_entry = {
+            "name": name, "model": model, "machine": "local",
+            "cgroup": True, "template": template_name,
+        }
 
-# ── UI config ────────────────────────────────────────────────────────────────
-tmux set-option -t "$SESSION" pane-border-status top
-tmux set-option -t "$SESSION" pane-border-format " #{pane_title} "
-tmux set-option -t "$SESSION" pane-active-border-style "fg=#e8a849"
-tmux set-option -t "$SESSION" pane-border-style "fg=#444444"
-tmux set-option -t "$SESSION" mouse on
-tmux set-option -t "$SESSION" status off
-tmux set-option -t "$SESSION" status-interval 10
-tmux set-option -t "$SESSION" status-style "bg=#1a1a2e,fg=#e8a849"
-tmux set-option -t "$SESSION" status-left-length 100
-tmux set-option -t "$SESSION" status-right-length 60
-tmux set-option -t "$SESSION" status-left " SOUL TEAM "
-tmux set-option -t "$SESSION" status-right " %H:%M "
+    agents.append(agent_entry)
+    _recalculate_layout(data)
+    _save_toml_from_dict(data, config_path)
 
-# ── Write scoped panes.json (only selected agents + team-lead) ───────────────
-{
-    echo "{"
-    echo "  \"team-lead\": \"${CEO}\""
-    for agent in "${SELECTED_AGENTS[@]}"; do
-        echo ", \"${agent}\": \"${PANE_MAP[$agent]}\""
-    done
-    echo "}"
-} | python3 -c "
-import json, sys, os
-panes = json.load(sys.stdin)
-out_path = os.path.expanduser('${PANES_JSON}')
-os.makedirs(os.path.dirname(out_path), exist_ok=True)
-with open(out_path, 'w') as f:
-    json.dump(panes, f, indent=2)
-print(f'panes.json written: {out_path} ({len(panes)} entries)')
-"
+    # Generate agent .md
+    agent_obj = Agent(
+        name=agent_entry["name"],
+        role=TEMPLATE_DESCRIPTIONS.get(agent_entry.get("template", ""), "custom agent"),
+        model=agent_entry["model"], machine=agent_entry["machine"],
+        template=agent_entry.get("template"),
+    )
+    CLAUDE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    agent_md_path = CLAUDE_AGENTS_DIR / f"{agent_entry['name']}.md"
+    agent_md_path.write_text(generate_agent_md(agent_obj))
 
-# ── Launch CEO immediately ───────────────────────────────────────────────────
-sleep 1
-tmux send-keys -t "$CEO" "export SOUL_AGENT_NAME=team-lead SOUL_TEAM_NAME=soul-team && $C" Enter
-tmux select-pane -t "$CEO"
+    ok(f"Added '{agent_entry['name']}' (model={agent_entry['model']}, machine={agent_entry['machine']})")
 
-echo ""
-echo "  CEO ready. ${#SELECTED_AGENTS[@]} agents launching with ${DELAY}s stagger..."
-echo "  Selected: ${SELECTED_AGENTS[*]}"
-echo ""
 
-# ── Time context for agent boot prompts ─────────────────────────────────────
-get_soul_time() {
-    local IST_TIME DATE DAY TIME HOUR WEEK DOW MODE
+def cmd_remove_agent(args) -> None:
+    """Remove an agent by name."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team' first.")
+        sys.exit(1)
 
-    IST_TIME=$(TZ=Asia/Kolkata date +"%Y-%m-%dT%H:%M:%S+05:30")
-    DATE=$(TZ=Asia/Kolkata date +"%Y-%m-%d")
-    DAY=$(TZ=Asia/Kolkata date +"%A")
-    TIME=$(TZ=Asia/Kolkata date +"%H:%M")
-    HOUR=$(TZ=Asia/Kolkata date +"%H" | sed "s/^0//")
-    WEEK=$(TZ=Asia/Kolkata date +"%V")
-    DOW=$(TZ=Asia/Kolkata date +"%u")  # 1=Mon, 7=Sun
+    data = _load_toml(config_path)
+    agents = data.get("agents", [])
+    agent_names = [a["name"] for a in agents]
 
-    MODE="NIGHT"
-    if   [ "$HOUR" -ge 6  ] && [ "$HOUR" -lt 11 ]; then MODE="MORNING"
-    elif [ "$HOUR" -ge 11 ] && [ "$HOUR" -lt 17 ]; then MODE="AFTERNOON"
-    elif [ "$HOUR" -ge 17 ] && [ "$HOUR" -lt 22 ]; then MODE="EVENING"
-    fi
+    name = args.name
+    if name not in agent_names:
+        fail(f"Agent '{name}' not found. Current: {', '.join(agent_names)}")
+        sys.exit(1)
 
-    cat <<SOUL_TIME_EOF
-[SOUL-TIME]
-datetime: ${IST_TIME}
-date: ${DATE}
-day: ${DAY}
-time: ${TIME} IST
-mode: ${MODE}
-week_number: ${WEEK}
-day_of_week: ${DOW}
-[/SOUL-TIME]
-SOUL_TIME_EOF
-}
+    data["agents"] = [a for a in agents if a["name"] != name]
+    _recalculate_layout(data)
+    _save_toml_from_dict(data, config_path)
 
-# ── Agent launch functions ────────────────────────────────────────────────────
-launch_local_agent() {
-    local PANE=$1
-    local AGENT=$2
-    local DEV_FLAG=""
-    [[ " $DEV_AGENTS " == *" $AGENT "* ]] && DEV_FLAG="--append-system-prompt-file $HOME/.claude/CLAUDE-dev.md"
-    # Export team env vars, then start Claude inside CPU-limited cgroup slice
-    tmux send-keys -t "$PANE" \
-        "export SOUL_AGENT_NAME=${AGENT} SOUL_TEAM_NAME=soul-team && systemd-run --user --slice=soul-agents.slice --scope $C --agent $AGENT $DEV_FLAG" \
-        Enter
-    # Wait for trust prompt or TUI to load
-    sleep 8
-    # Accept trust prompt if present (Enter), harmless if TUI already loaded
-    tmux send-keys -t "$PANE" Enter
-    # Wait for TUI to fully load
-    sleep 5
-    # Type boot prompt — prepend time context (single-line), then routine instruction
-    local TIME_CTX
-    TIME_CTX=$(get_soul_time | tr '\n' ' ')
-    local AGENT_BOOT="${TIME_CTX} ${BOOT} (You are ${AGENT}. Your preflight data is at ~/.soul/preflight/${AGENT}.txt -- read it instead of running individual checks. Then run: clawteam inbox receive soul-team --agent ${AGENT})"
-    tmux send-keys -t "$PANE" "$AGENT_BOOT" Enter
-}
+    agent_md = CLAUDE_AGENTS_DIR / f"{name}.md"
+    if agent_md.exists():
+        agent_md.unlink()
+        ok(f"Removed agent persona: {agent_md}")
 
-launch_remote_agent() {
-    local PANE=$1
-    local AGENT=$2
-    local DEV_FLAG=""
-    [[ " $DEV_AGENTS " == *" $AGENT "* ]] && DEV_FLAG="--append-system-prompt-file \$HOME/.claude/CLAUDE-dev.md"
-    # SSH into titan-pc with env vars exported, launch Claude agent
-    tmux send-keys -t "$PANE" \
-        "ssh -t $PC 'export SOUL_AGENT_NAME=${AGENT} SOUL_TEAM_NAME=soul-team && $C --agent $AGENT $DEV_FLAG'" \
-        Enter
-    # Wait for SSH + trust prompt
-    sleep 10
-    # Accept trust prompt
-    tmux send-keys -t "$PANE" Enter
-    # Wait for TUI
-    sleep 5
-    # Type boot prompt — prepend time context (single-line), then routine instruction
-    local TIME_CTX
-    TIME_CTX=$(get_soul_time | tr '\n' ' ')
-    local AGENT_BOOT="${TIME_CTX} ${BOOT} (You are ${AGENT}. Your preflight data is at ~/.soul/preflight/${AGENT}.txt -- read it instead of running individual checks. Then run: clawteam inbox receive soul-team --agent ${AGENT})"
-    tmux send-keys -t "$PANE" "$AGENT_BOOT" Enter
-}
+    ok(f"Removed '{name}' from config.")
 
-# ── Background: launch selected agents with stagger ──────────────────────────
-(
-    # ── Run preflight for all agents before launch ───────────────────────────
-    echo "  Running agent preflight..."
-    bash "${REPO_ROOT}/ops/agent-preflight.sh" --all 2>/dev/null || true
 
-    # ── Launch selected agents with stagger ──────────────────────────────────
-    sleep 3
-    for agent in "${SELECTED_AGENTS[@]}"; do
-        agent_pane="${PANE_MAP[$agent]}"
-        if [[ "${AGENT_MACHINE[$agent]}" == "local" ]]; then
-            launch_local_agent "$agent_pane" "$agent"
-        else
-            launch_remote_agent "$agent_pane" "$agent"
-        fi
-        sleep "$DELAY"
-    done
+def cmd_add_machine(args) -> None:
+    """Add a remote machine."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found. Run 'soul-team' first.")
+        sys.exit(1)
 
-    echo ""
-    echo "  ${#SELECTED_AGENTS[@]} agents launched."
+    data = _load_toml(config_path)
+    machines = data.setdefault("machines", [])
+    existing_names = {m["name"] for m in machines}
 
-    # ── Start soul-router (message router + discussion manager) ───────────
-    echo "  Starting soul-router.service..."
-    mkdir -p "$HOME/.claude/logs"
-    systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user start soul-router.service 2>/dev/null && \
-        echo "  Router: started." || \
-        echo "  Router: could not start via systemd — launching directly..."
-    # Fallback: launch directly if systemd fails
-    if ! systemctl --user is-active soul-router.service >/dev/null 2>&1; then
-        python3 "${REPO_ROOT}/router/router.py" >> "$HOME/.claude/logs/soul-router.log" 2>&1 &
-        echo "  Router PID: $!"
-    fi
+    if args.name in existing_names:
+        fail(f"Machine '{args.name}' already exists.")
+        sys.exit(1)
 
-    # ── Start courier daemon (replaces sidecars + bridge) ─────────────────
-    echo "  Starting soul-courier daemon..."
-    systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user start soul-courier.service 2>/dev/null && \
-        echo "  Courier: started via systemd." || \
-        echo "  Courier: systemd failed — launching directly..."
-    if ! systemctl --user is-active soul-courier.service >/dev/null 2>&1; then
-        PYTHONPATH="${REPO_ROOT}" python3 "${REPO_ROOT}/courier/main.py" \
-            >> "$HOME/.claude/logs/soul-courier.log" 2>&1 &
-        echo "  Courier PID: $!"
-    fi
+    if not args.no_test:
+        print(f"  Testing SSH to {args.ssh}...", end=" ", flush=True)
+        if test_ssh(args.ssh):
+            print(f"{GREEN}Connected{NC}")
+        else:
+            print(f"{RED}Failed{NC}")
+            warn("SSH test failed. Machine added anyway.")
 
-    # ── Start heartbeat ────────────────────────────────────────────────────
-    echo "  Starting soul-heartbeat daemon..."
-    bash "${REPO_ROOT}/ops/soul-heartbeat.sh" >> "$HOME/.claude/logs/soul-heartbeat.log" 2>&1 &
-    HBEAT_PID=$!
-    echo "  Heartbeat PID: $HBEAT_PID"
+    machines.append({"name": args.name, "ssh": args.ssh})
+    _save_toml_from_dict(data, config_path)
+    ok(f"Added machine '{args.name}' (ssh={args.ssh})")
 
-    # ── Start time beacon (mode transition broadcaster) ─────────────────
-    echo "  Starting soul-time-beacon..."
-    bash "${REPO_ROOT}/ops/soul-time-beacon.sh" >> "$HOME/.claude/logs/soul-time-beacon.log" 2>&1 &
-    BEACON_PID=$!
-    echo "  Time beacon PID: $BEACON_PID"
 
-    # ── Ensure guardian is running ─────────────────────────────────────────
-    echo "  Ensuring soul-guardian.service is running..."
-    systemctl --user start soul-guardian.service 2>/dev/null && \
-        echo "  Guardian: started/confirmed." || \
-        echo "  Guardian: could not start (may not be installed)."
+def cmd_list_agents(args) -> None:
+    """List current agent roster."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found. Run 'soul-team' first.")
+        sys.exit(1)
 
-    echo "  soul-team v2 fully initialized."
-) &
+    data = _load_toml(config_path)
+    agents = data.get("agents", [])
 
-# ── Create log dir if needed ────────────────────────────────────────────────
-mkdir -p "$HOME/.claude/logs"
+    if not agents:
+        print("  No agents configured.")
+        return
 
-tmux attach-session -t "$SESSION"
+    team_name = data.get("team", {}).get("name", "unnamed")
+    print(f"\n  {BOLD}Team: {team_name} ({len(agents)} agents){NC}\n")
+    print(f"    {'NAME':<20} {'MODEL':<10} {'MACHINE':<15} {'TEMPLATE'}")
+    print(f"    {'─' * 19} {'─' * 9} {'─' * 14} {'─' * 12}")
+    for a in agents:
+        tmpl = a.get("template", "-")
+        print(f"    {a['name']:<20} {a.get('model', 'sonnet'):<10} {a.get('machine', 'local'):<15} {tmpl}")
+    print()
+
+
+def cmd_list_machines(args) -> None:
+    """List configured machines."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found. Run 'soul-team' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+    machines = data.get("machines", [])
+    agents = data.get("agents", [])
+    agent_counts: dict[str, int] = {}
+    for a in agents:
+        m = a.get("machine", "local")
+        agent_counts[m] = agent_counts.get(m, 0) + 1
+
+    print(f"\n  {BOLD}Machines:{NC}\n")
+    print(f"    {'NAME':<20} {'SSH TARGET':<30} {'AGENTS'}")
+    print(f"    {'─' * 19} {'─' * 29} {'─' * 6}")
+    print(f"    {'local':<20} {'(this machine)':<30} {agent_counts.get('local', 0)}")
+    for m in machines:
+        name = m.get("name", "?")
+        ssh = m.get("ssh", "?")
+        print(f"    {name:<20} {ssh:<30} {agent_counts.get(name, 0)}")
+    print()
+
+
+def cmd_config(args) -> None:
+    """View or modify config settings."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found. Run 'soul-team' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+
+    if args.set_value:
+        key, _, value = args.set_value.partition("=")
+        key = key.strip()
+        value = value.strip()
+
+        if not value:
+            fail("Invalid format. Use: --set key=value")
+            sys.exit(1)
+
+        team_keys = {"name", "description", "boot_prompt", "stagger_seconds"}
+        policy_keys = {"permission_mode", "agent_memory", "communication", "guardian",
+                       "courier", "idle_shutdown", "idle_timeout_minutes"}
+
+        if key in team_keys:
+            section_name = "team"
+        elif key in policy_keys:
+            section_name = "policies"
+        else:
+            fail(f"Unknown key '{key}'. Valid: {', '.join(sorted(team_keys | policy_keys))}")
+            sys.exit(1)
+
+        section_data = data.setdefault(section_name, {})
+
+        if value.lower() in ("true", "false"):
+            typed_value = value.lower() == "true"
+        elif value.isdigit():
+            typed_value = int(value)
+        else:
+            typed_value = value
+
+        old_value = section_data.get(key, "(unset)")
+        section_data[key] = typed_value
+        _save_toml_from_dict(data, config_path)
+        ok(f"Set [{section_name}] {key} = {typed_value} (was: {old_value})")
+    else:
+        _view_config(data)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# QUICK STATUS (non-interactive)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _quick_status() -> None:
+    """Non-interactive status output."""
+    state, data = detect_state()
+
+    if state == "first_run":
+        print("  Status: not configured")
+        print("  Run 'soul-team' to set up.")
+        return
+
+    team_name = data.get("team", {}).get("name", "soul-team")
+    agents = data.get("agents", [])
+
+    if state == "running":
+        alive, total = _count_running_agents(team_name)
+        uptime = _get_session_uptime(team_name)
+        print(f"  Team: {team_name} | Agents: {alive}/{total} running | Uptime: {uptime}")
+    else:
+        print(f"  Team: {team_name} | Agents: {len(agents)} configured | Session: stopped")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MAIN: CLI ARGUMENT PARSING + STATE ROUTER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def handle_sigint(signum: int, frame) -> None:
+    _show_cursor()
+    print(f"\n\n  {YELLOW}Cancelled.{NC}\n")
+    sys.exit(130)
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    parser = argparse.ArgumentParser(
+        description="soul-team -- Multi-Agent Runtime for Claude Code",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Just run 'soul-team' with no arguments for interactive mode.
+            The CLI detects state automatically and shows the right interface.
+        """),
+    )
+
+    # Power-user flags (backward compat)
+    parser.add_argument("--dry-run", action="store_true", help="Validate config without launching")
+    parser.add_argument("--agents", type=str, default=None, help="Comma-separated list of agents to launch")
+    parser.add_argument("--continue", dest="cont", action="store_true", help="Reattach + heal + revive dead agents")
+    parser.add_argument("--all", action="store_true", help="Launch all agents (explicit)")
+    parser.add_argument("--status", action="store_true", help="Quick status check (non-interactive)")
+    parser.add_argument("--quick", action="store_true", help="Quick setup (3 agents, no prompts)")
+    parser.add_argument("-n", "--num-agents", type=int, default=3, help="Number of agents for --quick")
+
+    # Hidden subcommands for backward compat
+    subparsers = parser.add_subparsers(dest="command")
+
+    # init
+    init_parser = subparsers.add_parser("init", help="Setup wizard")
+    init_parser.add_argument("--quick", action="store_true", dest="init_quick")
+    init_parser.add_argument("-n", "--num-agents", type=int, default=3, dest="init_num")
+
+    # add-agent
+    add_agent_p = subparsers.add_parser("add-agent", help="Add agent")
+    add_agent_p.add_argument("template", nargs="?", default=None)
+    add_agent_p.add_argument("--custom", action="store_true")
+
+    # remove-agent
+    remove_agent_p = subparsers.add_parser("remove-agent", help="Remove agent")
+    remove_agent_p.add_argument("name")
+
+    # add-machine
+    add_machine_p = subparsers.add_parser("add-machine", help="Add machine")
+    add_machine_p.add_argument("name")
+    add_machine_p.add_argument("ssh")
+    add_machine_p.add_argument("--no-test", action="store_true")
+
+    # list-agents, list-machines, config
+    subparsers.add_parser("list-agents")
+    subparsers.add_parser("list-machines")
+    config_p = subparsers.add_parser("config")
+    config_p.add_argument("--set", dest="set_value")
+
+    args = parser.parse_args()
+
+    # ── Dispatch subcommands (backward compat) ──
+    if args.command == "init":
+        banner()
+        quick = getattr(args, "init_quick", False)
+        num = getattr(args, "init_num", 3)
+        should_launch = flow_first_run(quick=quick, num_agents=num)
+        if should_launch:
+            state, data = detect_state()
+            if data:
+                _launch_team(data)
+        return
+    if args.command == "add-agent":
+        if not args.template and not args.custom:
+            args.custom = True
+        cmd_add_agent(args)
+        return
+    if args.command == "remove-agent":
+        cmd_remove_agent(args)
+        return
+    if args.command == "add-machine":
+        cmd_add_machine(args)
+        return
+    if args.command == "list-agents":
+        cmd_list_agents(args)
+        return
+    if args.command == "list-machines":
+        cmd_list_machines(args)
+        return
+    if args.command == "config":
+        cmd_config(args)
+        return
+
+    # ── Quick status (non-interactive) ──
+    if args.status:
+        _quick_status()
+        return
+
+    # ── Detect state and route ──
+    state, data = detect_state()
+
+    # ── Power-user flags override interactive mode ──
+    selected_agents = None
+    if args.agents:
+        selected_agents = [a.strip() for a in args.agents.split(",")]
+
+    if args.quick:
+        banner()
+        should_launch = flow_first_run(quick=True, num_agents=args.num_agents)
+        if should_launch:
+            state, data = detect_state()
+            if data:
+                _launch_team(data)
+        return
+
+    if args.cont:
+        if data is None:
+            fail("No config found. Run 'soul-team' to set up first.")
+            sys.exit(1)
+        _continue_session(data)
+        return
+
+    if args.dry_run:
+        if data is None:
+            fail("No config found. Run 'soul-team' to set up first.")
+            sys.exit(1)
+        _dry_run(data, selected_agents)
+        return
+
+    if selected_agents:
+        if data is None:
+            fail("No config found. Run 'soul-team' to set up first.")
+            sys.exit(1)
+        _launch_team(data, selected_agents)
+        return
+
+    # ── Interactive mode: state-driven routing ──
+    banner()
+
+    if state == "first_run":
+        should_launch = flow_first_run()
+        if should_launch:
+            state, data = detect_state()
+            if data:
+                _launch_team(data)
+
+    elif state == "configured":
+        flow_configured(data)
+
+    elif state == "running":
+        flow_running(data)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,5 @@
 """
-Tests for soul-init wizard and management subcommands.
+Tests for soul-team unified CLI: setup wizard, management subcommands, and state detection.
 
 Covers:
 - Config path resolution
@@ -9,6 +9,9 @@ Covers:
 - config view/set subcommand
 - Template loading and model defaults
 - Layout recalculation
+- State detection (first_run, configured, running)
+- Interactive menu fallback
+- CLI flag parsing
 """
 from __future__ import annotations
 
@@ -20,18 +23,18 @@ from unittest import mock
 
 import pytest
 
-# Add repo root to path so we can import soul-init as a module
+# Add repo root to path so we can import soul-team as a module
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# soul-init has no .py extension — use importlib with explicit loader
+# soul-team has no .py extension — use importlib with explicit loader
 import importlib.util
 import importlib.machinery
 
-_soul_init_path = str(REPO_ROOT / "bin" / "soul-init")
-_loader = importlib.machinery.SourceFileLoader("soul_init", _soul_init_path)
-_spec = importlib.util.spec_from_loader("soul_init", _loader, origin=_soul_init_path)
+_soul_team_path = str(REPO_ROOT / "bin" / "soul-team")
+_loader = importlib.machinery.SourceFileLoader("soul_init", _soul_team_path)
+_spec = importlib.util.spec_from_loader("soul_init", _loader, origin=_soul_team_path)
 soul_init = importlib.util.module_from_spec(_spec)
-soul_init.__file__ = _soul_init_path
+soul_init.__file__ = _soul_team_path
 sys.modules["soul_init"] = soul_init
 _spec.loader.exec_module(soul_init)
 
@@ -522,3 +525,153 @@ class TestAvailableTemplates:
             assert content.startswith("---"), f"Template {t} missing frontmatter"
             assert "model_default:" in content, f"Template {t} missing model_default"
             assert "{{AGENT_NAME}}" in content, f"Template {t} missing {{AGENT_NAME}} placeholder"
+
+
+# ── State detection ────────────────────────────────────────────────────────
+
+class TestStateDetection:
+
+    def test_first_run_when_no_config(self, mock_home):
+        """No config file = first_run state."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SOUL_TEAM_CONFIG", None)
+            state, data = soul_init.detect_state()
+            assert state == "first_run"
+            assert data is None
+
+    def test_configured_when_config_exists_no_session(self, mock_home, sample_toml):
+        """Config exists, no tmux session = configured state."""
+        # Copy config to mock home
+        config_path = mock_home / ".soul-team" / "config.toml"
+        config_path.write_text(sample_toml.read_text())
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SOUL_TEAM_CONFIG", None)
+            with mock.patch("subprocess.run") as mock_run:
+                # tmux has-session returns non-zero (no session)
+                mock_run.return_value = mock.Mock(returncode=1)
+                state, data = soul_init.detect_state()
+                assert state == "configured"
+                assert data is not None
+                assert data["team"]["name"] == "test-team"
+
+    def test_running_when_session_exists(self, mock_home, sample_toml):
+        """Config exists, tmux session running = running state."""
+        config_path = mock_home / ".soul-team" / "config.toml"
+        config_path.write_text(sample_toml.read_text())
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SOUL_TEAM_CONFIG", None)
+            with mock.patch("subprocess.run") as mock_run:
+                # tmux has-session returns 0 (session exists)
+                mock_run.return_value = mock.Mock(returncode=0)
+                state, data = soul_init.detect_state()
+                assert state == "running"
+                assert data is not None
+
+
+# ── Interactive menu fallback ──────────────────────────────────────────────
+
+class TestInteractiveMenuFallback:
+
+    def test_raw_mode_check_no_tty(self):
+        """_supports_raw_mode returns False when stdin is not a tty."""
+        with mock.patch.object(sys, "stdin") as mock_stdin:
+            mock_stdin.isatty.return_value = False
+            assert soul_init._supports_raw_mode() is False
+
+    def test_select_menu_fallback_returns_default(self, monkeypatch):
+        """Fallback menu returns default when user presses Enter."""
+        monkeypatch.setattr("builtins.input", lambda _: "")
+        result = soul_init._select_menu_fallback(
+            "Pick one:", ["A", "B", "C"], None, 1, False
+        )
+        assert result == 1
+
+    def test_select_menu_fallback_returns_choice(self, monkeypatch):
+        """Fallback menu returns user's numbered choice."""
+        monkeypatch.setattr("builtins.input", lambda _: "2")
+        result = soul_init._select_menu_fallback(
+            "Pick one:", ["A", "B", "C"], None, 0, False
+        )
+        assert result == 1
+
+    def test_multi_select_fallback_returns_indices(self, monkeypatch):
+        """Fallback multi-select returns correct indices."""
+        monkeypatch.setattr("builtins.input", lambda _: "1,3")
+        result = soul_init._multi_select_fallback(
+            "Pick:", ["A", "B", "C"], None
+        )
+        assert result == [0, 2]
+
+
+# ── Quick start config ─────────────────────────────────────────────────────
+
+class TestQuickStartConfig:
+
+    def test_quick_start_creates_correct_agents(self):
+        config = soul_init._quick_start_config(3)
+        assert len(config.agents) == 3
+        assert config.agents[0].template == "developer"
+        assert config.agents[1].template == "researcher"
+        assert config.agents[2].template == "assistant"
+
+    def test_quick_start_wraps_templates(self):
+        config = soul_init._quick_start_config(20)
+        assert len(config.agents) == 20
+        # Templates should rotate
+        templates = [a.template for a in config.agents]
+        assert templates[0] == "developer"
+        assert templates[16] == "developer"
+
+
+# ── Data models ────────────────────────────────────────────────────────────
+
+class TestDataModels:
+
+    def test_team_config_defaults(self):
+        config = soul_init.TeamConfig()
+        assert config.team_name == "my-team"
+        assert config.stagger_seconds == 10
+        assert config.enable_guardian is True
+        assert config.agents == []
+
+    def test_agent_defaults(self):
+        agent = soul_init.Agent(name="test", role="testing")
+        assert agent.model == "sonnet"
+        assert agent.machine == "local"
+        assert agent.template is None
+        assert agent.cgroup is True
+
+
+# ── TOML generation ────────────────────────────────────────────────────────
+
+class TestTomlGeneration:
+
+    def test_generate_toml_basic(self):
+        config = soul_init.TeamConfig()
+        config.agents = [soul_init.Agent(name="dev", role="developer", template="developer")]
+        toml = soul_init.generate_toml(config)
+        assert "[team]" in toml
+        assert "[[agents]]" in toml
+        assert 'name = "dev"' in toml
+
+    def test_generate_toml_distributed(self):
+        config = soul_init.TeamConfig()
+        config.machines = [soul_init.Machine(name="worker-1", ssh_target="user@host")]
+        config.agents = [
+            soul_init.Agent(name="local-dev", role="dev", machine="local"),
+            soul_init.Agent(name="remote-dev", role="dev", machine="worker-1"),
+        ]
+        toml = soul_init.generate_toml(config)
+        assert "Local agents" in toml
+        assert "Remote agents" in toml
+
+
+# ── Version constant ───────────────────────────────────────────────────────
+
+class TestVersion:
+
+    def test_version_defined(self):
+        assert hasattr(soul_init, "VERSION")
+        assert soul_init.VERSION == "2.0.0"
