@@ -24,6 +24,7 @@ ReadWritePaths=%h/.clawteam
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=%h/soul-team
 
 [Install]
 WantedBy=default.target

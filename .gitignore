@@ -1,4 +1,9 @@
-# Python
+# ============================================
+# soul-team .gitignore
+# Comprehensive private data exclusion
+# ============================================
+
+# ── Python ──────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -13,7 +18,19 @@ build/
 venv/
 env/
 
-# Config (contains sensitive data)
+# ── Node / npm ──────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ── Test artifacts ──────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.prof
+
+# ── Config (contains sensitive data) ────────────────────────
 cluster.yaml
 config/soul-team.toml
 *.local.yaml
@@ -22,62 +39,99 @@ config/soul-team.toml
 !.env.example
 !config/*.example
 
-# Backup files
-*.bak
-*.bak.*
-
-# Secrets
+# ── Secrets / Credentials ──────────────────────────────────
 *.key
 *.pem
 *.p12
 *.pfx
 id_rsa
 id_ed25519
+credentials.json
+*.secret
+*.token
 
-# Runtime state
+# ── Databases ───────────────────────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+guardian.db
+*.sqlite
+*.sqlite3
+
+# ── Logs ────────────────────────────────────────────────────
+*.log
+*.jsonl
+logs/
+delivery-log-*.jsonl
+
+# ── Backup files ────────────────────────────────────────────
+*.bak
+*.bak.*
+*.old
+archive/
+
+# ── Runtime state ───────────────────────────────────────────
 *.pid
 *.sock
-*.log
-logs/
-
-# Tmux
-*.panes.json
+panes.json
 .panes.json
 
-# IDE
+# ── Agent memory / conversation data ────────────────────────
+agent-memory/
+conversations/
+chat-history/
+session-data/
+sessions/
+
+# ── Inbox / queue / courier ─────────────────────────────────
+inboxes/
+inbox/
+queue/
+courier-archive/
+events/
+broadcast/
+discussions/
+sidecar/
+
+# ── Guardian / health / heartbeat ───────────────────────────
+guardian_state.json
+agent_snapshots/
+health/
+preflight/
+heartbeat/
+heartbeat*.json
+*.heartbeat
+
+# ── ClawTeam runtime ────────────────────────────────────────
+.clawteam/
+
+# ── Briefs / reports (working docs, not repo) ──────────────
+briefs/
+tools-shared/
+
+# ── IDE / Editor ────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# OS
+# ── OS files ────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .Spotlight-V100
 .Trashes
 
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
-*.prof
-
-# Distribution
+# ── Distribution ────────────────────────────────────────────
 *.tar.gz
 *.zip
 
-# Node (if any tooling)
-node_modules/
-npm-debug.log*
+# ── Tmux state ──────────────────────────────────────────────
+*.panes.json
 
-# Guardian cache
-guardian_state.json
-agent_snapshots/
-
-# Always track example configs
-!examples/
-!examples/**
+# ── soul-team.toml (has real IPs/SSH targets) ──────────────
+soul-team.toml
+!soul-team.toml.example
 
 # ============================================
 # OPERATIONAL DATA — NEVER PUBLISH
@@ -145,6 +199,12 @@ pepper-roadmap.md
 *week-ahead*
 *ceo-action*
 
-# Specs, plans, and briefs — private
-briefs/
-tools-shared/
+# ── Always track these ──────────────────────────────────────
+!examples/
+!examples/**
+!install.sh
+!setup.sh
+!README.md
+!LICENSE
+!GUIDE.md
+!SOUL-TEAM.md

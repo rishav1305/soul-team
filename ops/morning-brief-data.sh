@@ -12,7 +12,7 @@ PREFLIGHT_DIR="$HOME/.soul/preflight"
 INBOX_ROOT="$HOME/soul-roles/shared/inbox"
 BRIEFS_DIR="$HOME/soul-roles/shared/briefs"
 BACKLOG_CLI="$HOME/.claude/skills/pa-backlog/backlog_cli.py"
-HEALTH_SCRIPT="$HOME/.claude/scripts/soul-health.sh"
+HEALTH_SCRIPT="$HOME/.local/bin/soul-health"
 GUARDIAN_DB="$HOME/.soul/guardian.db"
 SOUL_BOARD="$HOME/.local/bin/soul-board"
 

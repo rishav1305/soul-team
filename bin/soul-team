@@ -37,8 +37,11 @@ CLAWTEAM="$HOME/.local/bin/clawteam"
 TOML="$HOME/.claude/config/soul-team.toml"
 PANES_JSON="$HOME/.clawteam/teams/soul-team/panes.json"
 
+# ── Repo root (resolve via symlink from ~/.local/bin/ back to repo) ────────
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
 # ── Parse TOML via single helper (parse_toml.py + jq) ─────────────────────
-PARSE_TOML="$HOME/.claude/scripts/parse_toml.py"
+PARSE_TOML="${REPO_ROOT}/ops/parse_toml.py"
 if [ -f "$TOML" ] && [ -f "$PARSE_TOML" ]; then
     TOML_JSON=$(python3 "$PARSE_TOML" "$TOML" 2>/dev/null)
     if [ -n "$TOML_JSON" ]; then
@@ -102,7 +105,7 @@ if [[ "${1:-}" == "--continue" ]]; then
     # Phase 2: Heal — restart courier with fresh pane validation
     systemctl --user restart soul-courier.service 2>/dev/null || true
     pgrep -f "soul-router.py" >/dev/null || {
-        python3 "$HOME/.claude/scripts/soul-router.py" >> "$HOME/.claude/logs/soul-router.log" 2>&1 &
+        python3 "${REPO_ROOT}/router/router.py" >> "$HOME/.claude/logs/soul-router.log" 2>&1 &
         echo "  Router restarted (PID: $!)"
     }
 
@@ -536,7 +539,7 @@ launch_remote_agent() {
 (
     # ── Run preflight for all agents before launch ───────────────────────────
     echo "  Running agent preflight..."
-    bash "$HOME/.claude/scripts/agent-preflight.sh" --all 2>/dev/null || true
+    bash "${REPO_ROOT}/ops/agent-preflight.sh" --all 2>/dev/null || true
 
     # ── Launch selected agents with stagger ──────────────────────────────────
     sleep 3
@@ -562,7 +565,7 @@ launch_remote_agent() {
         echo "  Router: could not start via systemd — launching directly..."
     # Fallback: launch directly if systemd fails
     if ! systemctl --user is-active soul-router.service >/dev/null 2>&1; then
-        python3 "$HOME/.claude/scripts/soul-router.py" >> "$HOME/.claude/logs/soul-router.log" 2>&1 &
+        python3 "${REPO_ROOT}/router/router.py" >> "$HOME/.claude/logs/soul-router.log" 2>&1 &
         echo "  Router PID: $!"
     fi
 
@@ -573,20 +576,20 @@ launch_remote_agent() {
         echo "  Courier: started via systemd." || \
         echo "  Courier: systemd failed — launching directly..."
     if ! systemctl --user is-active soul-courier.service >/dev/null 2>&1; then
-        PYTHONPATH="$HOME/.claude/scripts" python3 "$HOME/.claude/scripts/soul-courier.py" \
+        PYTHONPATH="${REPO_ROOT}" python3 "${REPO_ROOT}/courier/main.py" \
             >> "$HOME/.claude/logs/soul-courier.log" 2>&1 &
         echo "  Courier PID: $!"
     fi
 
     # ── Start heartbeat ────────────────────────────────────────────────────
     echo "  Starting soul-heartbeat daemon..."
-    bash "$HOME/.claude/scripts/soul-heartbeat.sh" >> "$HOME/.claude/logs/soul-heartbeat.log" 2>&1 &
+    bash "${REPO_ROOT}/ops/soul-heartbeat.sh" >> "$HOME/.claude/logs/soul-heartbeat.log" 2>&1 &
     HBEAT_PID=$!
     echo "  Heartbeat PID: $HBEAT_PID"
 
     # ── Start time beacon (mode transition broadcaster) ─────────────────
     echo "  Starting soul-time-beacon..."
-    bash "$HOME/.claude/scripts/soul-time-beacon.sh" >> "$HOME/.claude/logs/soul-time-beacon.log" 2>&1 &
+    bash "${REPO_ROOT}/ops/soul-time-beacon.sh" >> "$HOME/.claude/logs/soul-time-beacon.log" 2>&1 &
     BEACON_PID=$!
     echo "  Time beacon PID: $BEACON_PID"
 
