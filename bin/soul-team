@@ -341,19 +341,116 @@ def confirm(prompt: str, default: bool = True) -> bool:
 
 
 def text_input(prompt: str, default: str = "", allow_empty: bool = False) -> str:
-    """Text input with default value."""
+    """Text input with default value. Uses raw mode line editor to handle arrow keys properly."""
     if default:
-        display = f"  {BRIGHT_BLUE}?{NC} {prompt} {DIM}({default}){NC}: "
+        prefix = f"  {BRIGHT_BLUE}?{NC} {prompt} {DIM}({default}){NC}: "
     else:
-        display = f"  {BRIGHT_BLUE}?{NC} {prompt}: "
+        prefix = f"  {BRIGHT_BLUE}?{NC} {prompt}: "
+
+    if not _supports_raw_mode():
+        # Fallback to basic input()
+        while True:
+            answer = input(prefix).strip()
+            if not answer and default:
+                return default
+            if answer or allow_empty:
+                return answer
+            print(f"    {RED}Please enter a value.{NC}")
+
+    import termios
+    import tty
 
     while True:
-        answer = input(display).strip()
+        sys.stdout.write(prefix)
+        sys.stdout.flush()
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        buf = []
+        cursor = 0  # cursor position within buf
+
+        try:
+            tty.setcbreak(fd)  # cbreak mode: keys available immediately but signals still work
+            while True:
+                ch = sys.stdin.read(1)
+
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    break
+                elif ch == "\x03":  # Ctrl+C
+                    sys.stdout.write("\n")
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    raise KeyboardInterrupt
+                elif ch == "\x04":  # Ctrl+D
+                    sys.stdout.write("\n")
+                    break
+                elif ch in ("\x7f", "\x08"):  # Backspace
+                    if cursor > 0:
+                        buf.pop(cursor - 1)
+                        cursor -= 1
+                        # Redraw from cursor position
+                        tail = "".join(buf[cursor:])
+                        sys.stdout.write(f"\b{tail} \b" + "\b" * len(tail))
+                        sys.stdout.flush()
+                elif ch == "\x1b":  # Escape sequence
+                    seq1 = sys.stdin.read(1)
+                    if seq1 == "[":
+                        seq2 = sys.stdin.read(1)
+                        if seq2 == "D" and cursor > 0:  # Left arrow
+                            cursor -= 1
+                            sys.stdout.write("\033[D")
+                            sys.stdout.flush()
+                        elif seq2 == "C" and cursor < len(buf):  # Right arrow
+                            cursor += 1
+                            sys.stdout.write("\033[C")
+                            sys.stdout.flush()
+                        elif seq2 == "H":  # Home
+                            sys.stdout.write(f"\033[{cursor}D")
+                            cursor = 0
+                            sys.stdout.flush()
+                        elif seq2 == "F":  # End
+                            move = len(buf) - cursor
+                            if move > 0:
+                                sys.stdout.write(f"\033[{move}C")
+                            cursor = len(buf)
+                            sys.stdout.flush()
+                        elif seq2 == "3":  # Delete key (sends \x1b[3~)
+                            sys.stdin.read(1)  # consume the ~
+                            if cursor < len(buf):
+                                buf.pop(cursor)
+                                tail = "".join(buf[cursor:])
+                                sys.stdout.write(f"{tail} \b" + "\b" * len(tail))
+                                sys.stdout.flush()
+                        # Ignore other escape sequences silently
+                    # Ignore bare Escape
+                elif ch == "\x15":  # Ctrl+U — clear line
+                    sys.stdout.write("\b" * cursor + " " * len(buf) + "\b" * len(buf))
+                    buf.clear()
+                    cursor = 0
+                    sys.stdout.flush()
+                elif ch == "\x0b":  # Ctrl+K — kill to end
+                    tail_len = len(buf) - cursor
+                    if tail_len > 0:
+                        sys.stdout.write(" " * tail_len + "\b" * tail_len)
+                        buf = buf[:cursor]
+                        sys.stdout.flush()
+                elif ch >= " ":  # Printable character
+                    buf.insert(cursor, ch)
+                    cursor += 1
+                    tail = "".join(buf[cursor:])
+                    sys.stdout.write(ch + tail + "\b" * len(tail))
+                    sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        answer = "".join(buf).strip()
         if not answer and default:
-            print(f"\033[A\033[2K  {GREEN}{CHECK}{NC} {prompt} {BOLD}{default}{NC}")
+            sys.stdout.write(f"\033[A\033[2K  {GREEN}{CHECK}{NC} {prompt} {BOLD}{default}{NC}\n")
+            sys.stdout.flush()
             return default
         if answer or allow_empty:
-            print(f"\033[A\033[2K  {GREEN}{CHECK}{NC} {prompt} {BOLD}{answer}{NC}")
+            sys.stdout.write(f"\033[A\033[2K  {GREEN}{CHECK}{NC} {prompt} {BOLD}{answer}{NC}\n")
+            sys.stdout.flush()
             return answer
         print(f"    {RED}Please enter a value.{NC}")
 
