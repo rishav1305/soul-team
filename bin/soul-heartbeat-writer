@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Heartbeat writer — agents call this to update their status.
+
+Usage:
+    python3 ~/.local/share/assistant/heartbeat.py working "SoulGraph Phase 1"
+    python3 ~/.local/share/assistant/heartbeat.py working "SoulGraph Phase 1" --next "Token optimization"
+    python3 ~/.local/share/assistant/heartbeat.py blocked "GSC token fix" --reason "waiting on CEO"
+    python3 ~/.local/share/assistant/heartbeat.py idle
+    python3 ~/.local/share/assistant/heartbeat.py offline
+
+The agent name is read from SOUL_AGENT_NAME env var.
+If not set, falls back to the --agent flag.
+
+This writes a single JSON file: ~/.local/share/assistant/heartbeat/{agent}.json
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+
+HEARTBEAT_DIR = os.path.expanduser("~/.local/share/assistant/heartbeat")
+IST = timezone(timedelta(hours=5, minutes=30))
+
+VALID_STATUSES = {"working", "blocked", "idle", "offline"}
+
+
+def write_heartbeat(agent, status, current_task="", blocked_on=None, next_task=None):
+    """Write heartbeat file for an agent."""
+    os.makedirs(HEARTBEAT_DIR, exist_ok=True)
+
+    now = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S+05:30")
+
+    # Read existing heartbeat to preserve 'since' if task unchanged
+    path = os.path.join(HEARTBEAT_DIR, f"{agent}.json")
+    since = now
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        if existing.get("current_task") == current_task and existing.get("status") == status:
+            since = existing.get("since", now)
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+
+    heartbeat = {
+        "agent": agent,
+        "status": status,
+        "current_task": current_task,
+        "since": since,
+        "updated": now,
+        "blocked_on": blocked_on,
+        "next_task": next_task,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(heartbeat, f, indent=2)
+
+    print(json.dumps({"ok": True, "agent": agent, "status": status, "file": path}))
+
+
+def main():
+    import argparse
+
+    p = argparse.ArgumentParser(description="Write agent heartbeat")
+    p.add_argument("status", choices=sorted(VALID_STATUSES),
+                   help="Agent status: working, blocked, idle, offline")
+    p.add_argument("task", nargs="?", default="",
+                   help="Current task description (required for working/blocked)")
+    p.add_argument("--agent", default=os.environ.get("SOUL_AGENT_NAME", ""),
+                   help="Agent name (default: $SOUL_AGENT_NAME)")
+    p.add_argument("--reason", default=None,
+                   help="Blocked reason (for blocked status)")
+    p.add_argument("--next", default=None, dest="next_task",
+                   help="Next task after current one completes")
+
+    args = p.parse_args()
+
+    if not args.agent:
+        print(json.dumps({"error": "No agent name. Set SOUL_AGENT_NAME or use --agent"}))
+        sys.exit(1)
+
+    if args.status in ("working", "blocked") and not args.task:
+        print(json.dumps({"error": f"Task description required for status '{args.status}'"}))
+        sys.exit(1)
+
+    write_heartbeat(
+        agent=args.agent,
+        status=args.status,
+        current_task=args.task,
+        blocked_on=args.reason if args.status == "blocked" else None,
+        next_task=args.next_task,
+    )
+
+
+if __name__ == "__main__":
+    main()

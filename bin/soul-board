@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Agent Task Board — single-command CEO view of all agent status.
+
+Reads heartbeat files + PA backlog to produce a unified operational view.
+Answers: who is working on what, who is blocked, who is idle, what's in backlog.
+
+Usage:
+    python3 ~/.local/share/assistant/board.py           # pretty terminal output
+    python3 ~/.local/share/assistant/board.py --json     # machine-readable JSON
+    python3 ~/.local/share/assistant/board.py --compact   # one-line-per-agent summary
+
+Design: Standalone script (not bolted onto backlog_cli.py).
+Rationale: backlog_cli.py is a task CRUD tool with QMD search integration.
+The board is a read-only aggregation view. Different concerns, different scripts.
+Both read from the same data directory. No coupling needed.
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_DIR = os.path.expanduser("~/.local/share/assistant/heartbeat")
+BACKLOG_DIR = os.path.expanduser("~/.local/share/assistant/backlog")
+AGENTS = [
+    "fury", "shuri", "hawkeye", "loki", "xavier",
+    "pepper", "happy", "stark", "banner", "friday",
+]
+STALE_THRESHOLD_MIN = 30  # heartbeat older than this = possibly offline
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# ---------------------------------------------------------------------------
+# Heartbeat reading
+# ---------------------------------------------------------------------------
+
+def read_heartbeat(agent):
+    """Read a single agent's heartbeat file. Returns dict or None."""
+    path = os.path.join(HEARTBEAT_DIR, f"{agent}.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def heartbeat_age_minutes(hb):
+    """Return minutes since last heartbeat update, or None if no timestamp."""
+    updated = hb.get("updated")
+    if not updated:
+        return None
+    try:
+        ts = datetime.fromisoformat(updated)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=IST)
+        now = datetime.now(IST)
+        delta = (now - ts).total_seconds() / 60.0
+        return round(delta, 1)
+    except (ValueError, TypeError):
+        return None
+
+
+def format_duration(minutes):
+    """Format minutes into human-readable duration."""
+    if minutes is None:
+        return "?"
+    if minutes < 1:
+        return "<1m"
+    if minutes < 60:
+        return f"{int(minutes)}m"
+    hours = int(minutes // 60)
+    remaining = int(minutes % 60)
+    if remaining == 0:
+        return f"{hours}h"
+    return f"{hours}h{remaining}m"
+
+
+def effective_status(hb):
+    """Determine effective status from heartbeat, accounting for staleness."""
+    if hb is None:
+        return "no_heartbeat"
+    status = hb.get("status", "unknown")
+    age = heartbeat_age_minutes(hb)
+    if status == "offline":
+        return "offline"
+    if age is not None and age > STALE_THRESHOLD_MIN and status in ("working", "idle"):
+        return "stale"
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Backlog reading (minimal — no dependency on backlog_cli.py)
+# ---------------------------------------------------------------------------
+
+def parse_frontmatter_minimal(filepath):
+    """Parse YAML frontmatter. Returns dict. Minimal, no external deps."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return {}
+    if not content.startswith("---"):
+        return {}
+    end = content.find("---", 3)
+    if end == -1:
+        return {}
+    fm = {}
+    for line in content[3:end].split("\n"):
+        s = line.strip()
+        if s and ":" in s and not s.startswith("-"):
+            key, val = s.split(":", 1)
+            fm[key.strip()] = val.strip()
+    return fm
+
+
+def get_agent_backlog(agent):
+    """Return list of non-done tasks for an agent from PA backlog."""
+    agent_dir = os.path.join(BACKLOG_DIR, agent)
+    if not os.path.isdir(agent_dir):
+        return []
+    tasks = []
+    for item in sorted(os.listdir(agent_dir)):
+        if not item.endswith(".md") or item.startswith("."):
+            continue
+        filepath = os.path.join(agent_dir, item)
+        fm = parse_frontmatter_minimal(filepath)
+        status = fm.get("status", "open").lower().strip()
+        if status in ("done", "completed", "closed"):
+            continue
+        title = item.replace(".md", "")
+        priority = fm.get("priority", fm.get("Priority", ""))
+        due_date = fm.get("due_date", fm.get("due", ""))
+        tasks.append({
+            "title": title,
+            "status": status,
+            "priority": priority,
+            "due_date": due_date,
+        })
+    # Sort by priority (lower number = higher priority), empty last
+    def sort_key(t):
+        p = t.get("priority", "")
+        try:
+            return int(p)
+        except (ValueError, TypeError):
+            return 999
+    tasks.sort(key=sort_key)
+    return tasks
+
+
+# ---------------------------------------------------------------------------
+# Board assembly
+# ---------------------------------------------------------------------------
+
+def build_board():
+    """Assemble the full board state."""
+    now = datetime.now(IST)
+    board = {
+        "timestamp": now.strftime("%Y-%m-%d %H:%M IST"),
+        "agents": [],
+    }
+    for agent in AGENTS:
+        hb = read_heartbeat(agent)
+        status = effective_status(hb)
+        backlog = get_agent_backlog(agent)
+
+        entry = {
+            "agent": agent,
+            "status": status,
+            "current_task": hb.get("current_task", "") if hb else "",
+            "blocked_on": hb.get("blocked_on") if hb else None,
+            "since": hb.get("since") if hb else None,
+            "updated": hb.get("updated") if hb else None,
+            "age_minutes": heartbeat_age_minutes(hb) if hb else None,
+            "next_task": hb.get("next_task") if hb else None,
+            "backlog_count": len(backlog),
+            "backlog_top3": backlog[:3],
+        }
+        board["agents"].append(entry)
+
+    # Compute summary
+    statuses = [a["status"] for a in board["agents"]]
+    total_backlog = sum(a["backlog_count"] for a in board["agents"])
+    board["summary"] = {
+        "working": statuses.count("working"),
+        "blocked": statuses.count("blocked"),
+        "idle": statuses.count("idle"),
+        "offline": statuses.count("offline"),
+        "stale": statuses.count("stale"),
+        "no_heartbeat": statuses.count("no_heartbeat"),
+        "total_backlog_items": total_backlog,
+    }
+    return board
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+def render_pretty(board):
+    """Render board as a formatted terminal string."""
+    lines = []
+    lines.append("")
+    lines.append(f"SOUL TEAM -- Agent Task Board    {board['timestamp']}")
+    lines.append("=" * 65)
+
+    # Group agents by status
+    working = [a for a in board["agents"] if a["status"] == "working"]
+    blocked = [a for a in board["agents"] if a["status"] == "blocked"]
+    idle = [a for a in board["agents"] if a["status"] == "idle"]
+    stale = [a for a in board["agents"] if a["status"] == "stale"]
+    offline = [a for a in board["agents"] if a["status"] == "offline"]
+    no_hb = [a for a in board["agents"] if a["status"] == "no_heartbeat"]
+
+    if working:
+        lines.append("")
+        lines.append("WORKING NOW:")
+        for a in working:
+            duration = format_duration(a["age_minutes"])
+            # Duration since task started, not since updated
+            since = a.get("since")
+            if since:
+                try:
+                    since_dt = datetime.fromisoformat(since)
+                    if since_dt.tzinfo is None:
+                        since_dt = since_dt.replace(tzinfo=IST)
+                    task_dur = (datetime.now(IST) - since_dt).total_seconds() / 60.0
+                    duration = format_duration(task_dur)
+                except (ValueError, TypeError):
+                    pass
+            task = a["current_task"] or "(no task set)"
+            bl = f"  {a['backlog_count']} queued" if a["backlog_count"] > 0 else ""
+            lines.append(f"  {a['agent']:<11} [{duration:>5}]  {task}{bl}")
+
+    if blocked:
+        lines.append("")
+        lines.append("BLOCKED:")
+        for a in blocked:
+            task = a["current_task"] or "(no task set)"
+            reason = a["blocked_on"] or "unknown"
+            since = a.get("since", "")
+            if since:
+                try:
+                    since_dt = datetime.fromisoformat(since)
+                    if since_dt.tzinfo is None:
+                        since_dt = since_dt.replace(tzinfo=IST)
+                    days = (datetime.now(IST) - since_dt).days
+                    since_str = f" (since {since_dt.strftime('%b %d')}, {days}d)" if days > 0 else ""
+                except (ValueError, TypeError):
+                    since_str = ""
+            else:
+                since_str = ""
+            lines.append(f"  {a['agent']:<11} {task} -- {reason}{since_str}")
+
+    if idle:
+        lines.append("")
+        lines.append("IDLE:")
+        for a in idle:
+            bl = f"  ({a['backlog_count']} backlog items)" if a["backlog_count"] > 0 else ""
+            lines.append(f"  {a['agent']:<11} no active task{bl}")
+
+    if stale:
+        lines.append("")
+        lines.append("STALE (heartbeat >30min, may be offline):")
+        for a in stale:
+            age = format_duration(a["age_minutes"])
+            task = a["current_task"] or "?"
+            lines.append(f"  {a['agent']:<11} last seen {age} ago -- {task}")
+
+    if offline:
+        lines.append("")
+        lines.append("OFFLINE:")
+        for a in offline:
+            lines.append(f"  {a['agent']}")
+
+    if no_hb:
+        lines.append("")
+        lines.append("NO HEARTBEAT (not yet adopted):")
+        for a in no_hb:
+            bl = f"  ({a['backlog_count']} backlog items)" if a["backlog_count"] > 0 else ""
+            lines.append(f"  {a['agent']}{bl}")
+
+    # Backlog section — show top 3 per agent (only for agents with items)
+    agents_with_backlog = [a for a in board["agents"] if a["backlog_count"] > 0]
+    if agents_with_backlog:
+        lines.append("")
+        lines.append("BACKLOG (top 3 per agent, by priority):")
+        for a in agents_with_backlog:
+            for i, task in enumerate(a["backlog_top3"]):
+                prefix = f"  {a['agent']:<11}" if i == 0 else "             "
+                p_str = f"[P{task['priority']}]" if task["priority"] else "[P?]"
+                due = ""
+                if task.get("due_date"):
+                    try:
+                        due_dt = datetime.strptime(task["due_date"], "%Y-%m-%d").date()
+                        if due_dt < datetime.now(IST).date():
+                            due = f" (OVERDUE {task['due_date']})"
+                        else:
+                            due = f" (due {task['due_date']})"
+                    except ValueError:
+                        due = f" (due {task['due_date']})"
+                status_tag = ""
+                if task["status"] == "blocked":
+                    status_tag = " [BLOCKED]"
+                lines.append(f"{prefix} {p_str:<5} {task['title']}{due}{status_tag}")
+            remaining = a["backlog_count"] - len(a["backlog_top3"])
+            if remaining > 0:
+                lines.append(f"             ... +{remaining} more")
+
+    # Summary line
+    s = board["summary"]
+    lines.append("")
+    status_parts = []
+    if s["working"]:
+        status_parts.append(f"{s['working']} working")
+    if s["blocked"]:
+        status_parts.append(f"{s['blocked']} blocked")
+    if s["idle"]:
+        status_parts.append(f"{s['idle']} idle")
+    if s["stale"]:
+        status_parts.append(f"{s['stale']} stale")
+    if s["offline"]:
+        status_parts.append(f"{s['offline']} offline")
+    if s["no_heartbeat"]:
+        status_parts.append(f"{s['no_heartbeat']} no heartbeat")
+    lines.append(f"STATS: {', '.join(status_parts)} | {s['total_backlog_items']} total backlog items")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_compact(board):
+    """One-line-per-agent compact view."""
+    lines = [f"Board @ {board['timestamp']}"]
+    for a in board["agents"]:
+        status = a["status"].upper()[:4]
+        task = (a["current_task"] or "-")[:50]
+        bl = a["backlog_count"]
+        lines.append(f"  {a['agent']:<10} {status:<5} {task:<52} BL:{bl}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    mode = "pretty"
+    if "--json" in sys.argv:
+        mode = "json"
+    elif "--compact" in sys.argv:
+        mode = "compact"
+
+    board = build_board()
+
+    if mode == "json":
+        print(json.dumps(board, indent=2))
+    elif mode == "compact":
+        print(render_compact(board))
+    else:
+        print(render_pretty(board))
+
+
+if __name__ == "__main__":
+    main()

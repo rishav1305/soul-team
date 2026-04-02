@@ -1,5 +1,4 @@
-"""Soul Courier — tests for the PaneManager module."""
-
+"""Tests for PaneManager — tmux pane state detection, injection, verification."""
 import time
 from unittest.mock import patch, MagicMock
 from soul_courier.pane import PaneManager
@@ -22,7 +21,7 @@ def test_detect_state_dead_capture_fails():
 
 def test_detect_state_crashed():
     pm = _make_pm()
-    content = "some output\nuser@hostname:~$ \n"
+    content = "some output\nrishav@titan-pi:~$ \n"
     with patch.object(pm, "_tmux_capture", return_value=content):
         assert pm.detect_state("fury") == "crashed"
 
@@ -67,15 +66,55 @@ def test_detect_state_cache_expired():
         assert mock_cap.call_count == 2
 
 
-def test_inject_uses_named_buffer():
+def test_inject_uses_send_keys():
+    """Short messages use send-keys -l (literal) for reliable delivery."""
     pm = _make_pm()
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, patch("time.sleep"):
         mock_run.return_value = MagicMock(returncode=0)
         result = pm.inject("fury", "hello world")
         assert result is True
+        # send-keys -l, Enter (safety-net second Enter removed in Phase 1E)
+        assert mock_run.call_count == 2
+        first_call = mock_run.call_args_list[0]
+        assert "-l" in first_call.args[0]
+        assert "hello world" in first_call.args[0]
+
+
+def test_inject_falls_back_to_paste_buffer_for_large_messages():
+    """Messages exceeding SENDKEYS_MAX_CHARS use paste-buffer fallback."""
+    pm = _make_pm()
+    large_msg = "x" * (pm.SENDKEYS_MAX_CHARS + 100)
+    with patch("subprocess.run") as mock_run, patch("time.sleep"), \
+         patch("tempfile.mkstemp", return_value=(999, "/tmp/test.txt")), \
+         patch("os.fdopen", return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock())), \
+         patch("os.unlink"):
+        mock_run.return_value = MagicMock(returncode=0)
+        result = pm.inject("fury", large_msg)
+        assert result is True
+        # load-buffer, paste-buffer, Enter (safety-net second Enter removed in Phase 1E)
+        assert mock_run.call_count == 3
         load_call = mock_run.call_args_list[0]
-        assert "-b" in load_call.args[0]
+        assert "load-buffer" in load_call.args[0]
         assert "courier-fury" in load_call.args[0]
+
+
+def test_inject_delay_scales_with_message_size():
+    """Longer messages get more delay before Enter to let TUI process input."""
+    pm = _make_pm()
+    sleep_calls = []
+    with patch("subprocess.run") as mock_run, \
+         patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+        mock_run.return_value = MagicMock(returncode=0)
+        # 30-line message should get ~1.2s delay (0.3 + 30*0.03)
+        long_msg = "\n".join(f"line {i}" for i in range(30))
+        pm.inject("fury", long_msg)
+        # Only the scaled delay remains (safety-net 0.4s sleep removed in Phase 1E)
+        assert sleep_calls[0] >= 1.0  # 0.3 base + 30*0.03 = 1.2
+
+        sleep_calls.clear()
+        # Short message should get ~0.33s delay (0.3 + 1*0.03)
+        pm.inject("fury", "short")
+        assert sleep_calls[0] <= 0.4
 
 
 def test_verify_injection_success():

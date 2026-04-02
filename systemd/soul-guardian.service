@@ -1,16 +1,13 @@
 [Unit]
 Description=Soul Team Guardian — agent health watchdog
-Documentation=https://github.com/your-org/soul-team
+Documentation=https://github.com/rishav1305/soul-team
 After=network.target soul-courier.service
 Wants=soul-courier.service
 
 [Service]
 Type=simple
-User=%i
-WorkingDirectory=%h/.local/share/soul-team
-ExecStart=/usr/bin/python3 %h/.local/share/soul-team/guardian/guardian.py \
-    --config %h/.config/soul-team/cluster.yaml \
-    --log-level info
+WorkingDirectory=%h/soul-team
+ExecStart=/usr/bin/python3 %h/soul-team/guardian/guardian.py
 Restart=on-failure
 RestartSec=10s
 StartLimitIntervalSec=120
@@ -20,8 +17,10 @@ StartLimitBurst=3
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=%h/.local/share/soul-team
-ReadWritePaths=%h/.config/soul-team
+ReadWritePaths=%h/soul-team
+ReadWritePaths=%h/.claude/config
+ReadWritePaths=%h/.soul
+ReadWritePaths=%h/.clawteam
 
 # Allow reading system temperature files (for hardware monitoring)
 ReadOnlyPaths=/sys/class/thermal
@@ -32,18 +31,3 @@ Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=default.target
-
-# Usage:
-#   systemctl --user enable soul-guardian
-#   systemctl --user start soul-guardian
-#   systemctl --user status soul-guardian
-#   journalctl --user -u soul-guardian -f
-#
-# The guardian monitors agent health and applies resource limits.
-# Configure thresholds in cluster.yaml under machines[].guardian section.
-#
-# Metrics monitored per agent:
-#   - CPU usage (cgroup slice)
-#   - Memory usage
-#   - Temperature (primary machine only)
-#   - Agent responsiveness (heartbeat)

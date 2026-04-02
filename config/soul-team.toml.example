@@ -1,0 +1,95 @@
+# Soul Team v2 — Launcher Config
+# File: ~/.claude/config/soul-team.toml
+# Purpose: Defines machine distribution, model assignments, cgroup flags, and
+#          tmux layout for the soul-team launcher script.
+# NOTE: This is read by soul-team.sh (our custom launcher), NOT by clawteam launch.
+#       ClawTeam handles coordination only; this config handles infrastructure.
+
+[team]
+name = "soul-team"
+description = "Full Marvel agent team — distributed AI coordination"
+boot_prompt = "Run your daily routine. Check your inbox at the START and BETWEEN EACH STEP of your routine. Then enter proactive mode when idle, checking inbox between each proactive task."
+stagger_seconds = 10
+
+# ─── Local agents (cgroup-limited) — LEADERSHIP ───
+# Model assignments via CARS/ACRS analysis
+# Opus >= 24, Sonnet 16-23, Haiku <= 15 (Sonnet floor applied)
+
+[[agents]]
+name = "pepper"
+model = "sonnet"       # ACRS: 19/30 — structured product reviews
+machine = "local"
+cgroup = true
+
+[[agents]]
+name = "xavier"
+model = "opus"         # ACRS: 26/30 — decision gate + deep reasoning
+machine = "local"
+cgroup = true
+
+[[agents]]
+name = "hawkeye"
+model = "sonnet"       # ACRS: 13/30 — procedural pipeline ops (Sonnet floor)
+machine = "local"
+cgroup = true
+
+[[agents]]
+name = "fury"
+model = "opus"         # ACRS: 28/30 — cross-domain strategy synthesis
+machine = "local"
+cgroup = true
+
+[[agents]]
+name = "loki"
+model = "sonnet"       # ACRS: 16/30 — content with skill support
+machine = "local"
+cgroup = true
+
+# ─── Remote agents (full compute) — DEVS ───
+# Replace SSH targets below with your actual remote machine
+
+[[agents]]
+name = "happy"
+model = "sonnet"       # ACRS: 16/30 — machine-verifiable QA output
+machine = "remote-pc"
+ssh = "user@192.168.0.XXX"
+cgroup = false
+
+[[agents]]
+name = "shuri"
+model = "opus"         # ACRS: 27/30 — code quality, no downstream safety net
+machine = "remote-pc"
+ssh = "user@192.168.0.XXX"
+cgroup = false
+
+[[agents]]
+name = "stark"
+model = "sonnet"       # ACRS: 19/30 — paper trading, structured analysis
+machine = "remote-pc"
+ssh = "user@192.168.0.XXX"
+cgroup = false
+
+[[agents]]
+name = "banner"
+model = "sonnet"       # ACRS: 20/30 — structured data work (Opus for CARS runs)
+machine = "remote-pc"
+ssh = "user@192.168.0.XXX"
+cgroup = false
+
+# ─── tmux layout ───
+
+[layout]
+columns = 4  # CEO + 3 agent columns
+rows = 3     # 3 agents per column
+
+[[layout.grid]]
+col = 1
+agents = ["pepper", "xavier", "hawkeye"]
+
+[[layout.grid]]
+col = 2
+agents = ["fury", "loki"]
+
+[[layout.grid]]
+col = 3
+agents = ["happy", "shuri", "stark", "banner"]

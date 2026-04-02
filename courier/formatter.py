@@ -1,20 +1,11 @@
-"""Soul Courier — message formatting for tmux pane injection.
-
-Formats incoming messages into human-readable text blocks suitable for
-pasting into agent tmux panes. Supports direct messages, broadcasts,
-group discussions, status updates, P1 interrupts, and batch summaries.
-"""
-
+"""Format messages for tmux pane injection. Matches existing sidecar output formats."""
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
 
 log = logging.getLogger("soul-courier.formatter")
-
-TEAM_NAME = os.environ.get("SOUL_TEAM_NAME", "soul-team")
 
 
 class MessageFormatter:
@@ -45,7 +36,7 @@ class MessageFormatter:
             return (
                 f"[BROADCAST] From: {from_user}\n"
                 f"---\n{content}\n---\n"
-                f"Respond to CEO inbox via: clawteam inbox send {TEAM_NAME} "
+                f"Respond to CEO inbox via: clawteam inbox send soul-team "
                 f"team-lead \"your response\" --from {agent}"
             )
 
@@ -74,7 +65,7 @@ class MessageFormatter:
             f"[INBOX] From: {from_user} | Type: {msg_type}\n"
             f"---\n{content}\n---\n"
             f"Respond by writing to {from_user}'s inbox via: "
-            f"clawteam inbox send {TEAM_NAME} {from_user} "
+            f"clawteam inbox send soul-team {from_user} "
             f"\"your response\" --from {agent}"
         )
 
@@ -121,7 +112,7 @@ class MessageFormatter:
             f"- What steps remain\n\n"
             f"STEP 2: Handle this message:\n"
             f"---\n{content}\n---\n"
-            f"Respond via: clawteam inbox send {TEAM_NAME} {from_user} "
+            f"Respond via: clawteam inbox send soul-team {from_user} "
             f"\"your response\" --from {agent}\n\n"
             f"STEP 3: After handling, check your memory for \"interrupted-state\". "
             f"If found:\n"
@@ -149,8 +140,7 @@ class MessageFormatter:
 
     @staticmethod
     def _build_thread_summary(thread_id: str) -> str:
-        team_name = os.environ.get("SOUL_TEAM_NAME", "soul-team")
-        disc_dir = Path.home() / ".clawteam" / "teams" / team_name / "discussions" / thread_id
+        disc_dir = Path.home() / ".clawteam/teams/soul-team/discussions" / thread_id
         if not disc_dir.is_dir():
             return ""
         lines = []

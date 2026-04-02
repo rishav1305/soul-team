@@ -1,13 +1,8 @@
-"""Soul Courier — per-agent message queue with disk persistence.
-
-Provides an in-memory deque per agent with periodic flush to disk (JSON).
-Supports FIFO ordering, thread-batch detection for overflow batching,
-and atomic writes via tempfile + rename.
-"""
-
+"""Per-agent message queue with in-memory deque and disk persistence."""
 import json
 import logging
 import tempfile
+import threading
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
@@ -20,37 +15,47 @@ class MessageQueue:
         self._dir = queue_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self._queues: dict[str, deque[Path]] = defaultdict(deque)
+        self._lock = threading.Lock()
 
     def add(self, agent: str, msg_file: Path) -> None:
-        self._queues[agent].append(msg_file)
+        with self._lock:
+            if msg_file not in self._queues[agent]:
+                self._queues[agent].append(msg_file)
 
     def pop(self, agent: str) -> Optional[Path]:
-        q = self._queues.get(agent)
-        if q:
-            return q.popleft()
-        return None
+        with self._lock:
+            q = self._queues.get(agent)
+            if q:
+                return q.popleft()
+            return None
 
     def has_messages(self, agent: str) -> bool:
-        q = self._queues.get(agent)
-        return bool(q)
+        with self._lock:
+            q = self._queues.get(agent)
+            return bool(q)
 
     def agents_with_messages(self) -> list[str]:
-        return [a for a, q in self._queues.items() if q]
+        with self._lock:
+            return [a for a, q in list(self._queues.items()) if q]
 
     def remove(self, agent: str, msg_file: Path) -> None:
-        q = self._queues.get(agent)
-        if q:
-            try:
-                q.remove(msg_file)
-            except ValueError:
-                pass
+        with self._lock:
+            q = self._queues.get(agent)
+            if q:
+                try:
+                    q.remove(msg_file)
+                except ValueError:
+                    pass
 
     def peek_thread_batch(self, agent: str, min_count: int = 3):
-        q = self._queues.get(agent)
-        if not q or len(q) < min_count:
-            return None
+        with self._lock:
+            q = self._queues.get(agent)
+            if not q or len(q) < min_count:
+                return None
+            # Snapshot to iterate safely
+            queue_snapshot = list(q)
         threads: dict[str, list[Path]] = {}
-        for f in q:
+        for f in queue_snapshot:
             if not f.exists():
                 continue
             try:
@@ -66,9 +71,12 @@ class MessageQueue:
         return None
 
     def flush(self) -> None:
-        for agent, q in self._queues.items():
+        with self._lock:
+            items = list(self._queues.items())
+        for agent, q in items:
             qf = self._dir / f"{agent}.json"
-            data = [str(p) for p in q]
+            with self._lock:
+                data = [str(p) for p in q]
             tmp = None
             try:
                 tmp = tempfile.NamedTemporaryFile(
@@ -91,7 +99,8 @@ class MessageQueue:
                     raise ValueError("not a list")
                 valid = [Path(p) for p in data if Path(p).exists()]
                 if valid:
-                    self._queues[agent] = deque(valid)
+                    with self._lock:
+                        self._queues[agent] = deque(valid)
             except (json.JSONDecodeError, ValueError):
-                log.warning("Corrupt queue file %s -- resetting", qf)
+                log.warning("Corrupt queue file %s — resetting", qf)
                 qf.write_text("[]")

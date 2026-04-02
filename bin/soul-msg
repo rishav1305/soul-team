@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """
-soul-msg — CLI for multi-agent team coordination via ClawTeam.
-
-Part of the soul-team open-source multi-agent framework.
-Thin wrapper around clawteam CLI + native Teams inbox for the team lead.
-
-Configuration (environment variables):
-    SOUL_TEAM_NAME    — Team name (default: "soul-team")
-    SOUL_AGENT_NAME   — Your agent identity (default: "team-lead")
-    CLAWTEAM_BIN      — Path to clawteam binary (default: ~/.local/bin/clawteam)
-    CLAWTEAM_DATA_DIR — Path to clawteam data dir (default: ~/.clawteam)
-    SOUL_TEAM_CONFIG  — Path to native team config JSON (default: ~/.claude/teams/<team>/config.json)
+soul-msg — CEO bridge CLI for ClawTeam soul-team coordination.
+Thin wrapper around clawteam CLI + native Teams inbox for team-lead.
 """
 
 import argparse
@@ -22,12 +13,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────────
-TEAM = os.environ.get("SOUL_TEAM_NAME", "soul-team")
+TEAM = "soul-team"
+CLAWTEAM = os.path.expanduser("~/.local/bin/clawteam")
+NATIVE_INBOX_DIR = Path(os.path.expanduser("~/.claude/teams/soul-team/inboxes"))
+NATIVE_INBOX_LEAD = NATIVE_INBOX_DIR / "team-lead.json"
+CLAWTEAM_DATA = Path(os.path.expanduser("~/.clawteam"))
 SENDER = os.environ.get("SOUL_AGENT_NAME", "team-lead")
-CLAWTEAM = os.environ.get("CLAWTEAM_BIN", str(Path.home() / ".local" / "bin" / "clawteam"))
-CLAWTEAM_DATA = Path(os.environ.get("CLAWTEAM_DATA_DIR", str(Path.home() / ".clawteam")))
-NATIVE_INBOX_DIR = Path.home() / ".claude" / "teams" / TEAM / "inboxes"
-NATIVE_INBOX_LEAD = NATIVE_INBOX_DIR / f"{SENDER}.json"
+
+AGENTS = [
+    "happy", "shuri", "loki", "fury",
+    "xavier", "hawkeye", "stark", "banner", "pepper"
+]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -74,14 +70,6 @@ def priority_tag(priority):
     return {"P1": "urgent", "P2": "normal", "P3": "low"}.get(priority, "normal")
 
 
-def _get_team_config_path():
-    """Return the path to the native team config JSON."""
-    env_path = os.environ.get("SOUL_TEAM_CONFIG")
-    if env_path:
-        return Path(env_path)
-    return Path.home() / ".claude" / "teams" / TEAM / "config.json"
-
-
 # ── Subcommands ──────────────────────────────────────────────────────────────
 
 def cmd_send(args):
@@ -101,10 +89,10 @@ def cmd_send(args):
 
     print(out.strip() if out.strip() else f"Sent to {recipient} [{priority}]")
 
-    # Mirror to native inbox if sending to self (team-lead)
-    if recipient == SENDER:
+    # Mirror to native inbox if sending to team-lead
+    if recipient == "team-lead":
         append_native_inbox(SENDER, message)
-        print(f"  (mirrored to native {SENDER} inbox)")
+        print("  (mirrored to native team-lead inbox)")
 
 
 def cmd_inbox(args):
@@ -113,7 +101,7 @@ def cmd_inbox(args):
 
     if err or data is None:
         # Fall back to native inbox for team-lead
-        if NATIVE_INBOX_LEAD.exists():
+        if SENDER == "team-lead" and NATIVE_INBOX_LEAD.exists():
             try:
                 msgs = json.loads(NATIVE_INBOX_LEAD.read_text())
             except (json.JSONDecodeError, IOError):
@@ -157,7 +145,7 @@ def cmd_broadcast(args):
     if rc != 0:
         print(f"ERROR: broadcast failed: {err.strip()}", file=sys.stderr)
         sys.exit(1)
-    print(out.strip() if out.strip() else "Broadcast sent to all agents.")
+    print(out.strip() if out.strip() else f"Broadcast sent to all agents.")
 
 
 def cmd_status(args):
@@ -185,8 +173,8 @@ def _print_status(cfg):
         leader_mark = " (lead)" if m.get("agentId") == lead_id else ""
         print(f"  {name:<14} {atype:<10} {aid:<16} {joined}{leader_mark}")
 
-    # Also show tmux pane info from native config if available
-    native_cfg_path = _get_team_config_path()
+    # Also show tmux pane info from our native config if available
+    native_cfg_path = Path(os.path.expanduser("~/.claude/teams/soul-team/config.json"))
     if native_cfg_path.exists():
         try:
             native = json.loads(native_cfg_path.read_text())
@@ -219,7 +207,7 @@ def _print_status(cfg):
 def cmd_peek(args):
     agent = args.agent
     # Look up pane from native config (has tmux pane IDs)
-    config_path = _get_team_config_path()
+    config_path = Path(os.path.expanduser("~/.claude/teams/soul-team/config.json"))
     pane_id = None
     if config_path.exists():
         cfg = json.loads(config_path.read_text())
@@ -266,13 +254,13 @@ def cmd_history(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="soul-msg",
-        description="CLI for soul-team multi-agent coordination",
+        description="CEO bridge CLI for soul-team agent coordination",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # send
     p_send = sub.add_parser("send", help="Send message to an agent")
-    p_send.add_argument("recipient", help="Agent name")
+    p_send.add_argument("recipient", help="Agent name (e.g. happy, shuri)")
     p_send.add_argument("message", help="Message text")
     p_send.add_argument("--priority", choices=["P1", "P2", "P3"], default="P2")
 

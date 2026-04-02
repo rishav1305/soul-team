@@ -1,5 +1,3 @@
-"""Soul Courier — tests for the MessageFormatter module."""
-
 import json
 import tempfile
 from pathlib import Path

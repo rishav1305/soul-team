@@ -15,10 +15,16 @@ env/
 
 # Config (contains sensitive data)
 cluster.yaml
+config/soul-team.toml
 *.local.yaml
 .env
 .env.*
 !.env.example
+!config/*.example
+
+# Backup files
+*.bak
+*.bak.*
 
 # Secrets
 *.key

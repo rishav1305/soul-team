@@ -16,7 +16,7 @@ Environment:
     SOUL_TEAM_NAME         tmux session name (default: soul-team)
     SOUL_GUARDIAN_LOG      Path to log file (default: ~/.soul/guardian.log)
     SOUL_TEAM_CONFIG       Path to team config JSON (default: ~/.soul/team-config.json)
-    SOUL_TEAM_TOML         Path to team TOML (default: ~/.soul/soul-team.toml)
+    SOUL_TEAM_TOML         Path to team TOML (default: ~/.claude/config/soul-team.toml)
     SOUL_BRIDGE_SCRIPT     Path to bridge daemon script (optional)
     SOUL_MSG_BIN           Path to messaging binary (optional)
     SOUL_CRITICAL_AGENTS   Comma-separated agent names that must never be paused (default: empty)
@@ -24,8 +24,10 @@ Environment:
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
+import shlex
 import threading
 import os
 import re
@@ -34,7 +36,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 
 # -- Constants ----------------------------------------------------------------
@@ -57,7 +61,7 @@ RESTART_STAGGER_S = 90         # min seconds between consecutive agent restarts 
 IDLE_WAKE_STAGGER_S = 20       # min seconds between idle-wake restarts (surgical)
 
 # Idle shutdown
-IDLE_TIMEOUT_S = 300           # 5 min of no pane activity before shutdown
+IDLE_TIMEOUT_S = 900           # 15 min of no pane activity before shutdown
 IDLE_PRE_EXIT_WAIT_S = 30     # save window before /exit
 IDLE_CHECK_INTERVAL_S = 60    # check idle state every minute
 IDLE_WAKE_BOOT_WAIT_S = 3     # wait for TUI after launch (no trust prompt)
@@ -109,15 +113,42 @@ COMPACT_TRIGGER_RE = re.compile(
     r"context.*(limit|full|running out|compact)", re.IGNORECASE
 )
 
-# Auto-continue: safe prompts to answer Y
+# Auto-continue: ONLY match Claude Code's own tool permission prompts.
+# These are tightly scoped to prevent matching arbitrary [Y/n] from shell commands.
 SAFE_AUTO_APPROVE_RE = re.compile(
-    r"(\[Y/n\]|Do you want to proceed|Allow .* to make changes|Press Enter to continue)",
+    r"("
+    r"Allow\s+(?:Read|Write|Edit|Bash|Glob|Grep|WebSearch|WebFetch|Skill|Agent|mcp__)"  # Claude Code tool permission
+    r"|Do you want to proceed\?.*\[Y/n\]"  # Claude Code proceed prompt
+    r"|Press Enter to continue"            # Claude Code output continuation
+    r"|Allow [\w-]+ tool"                  # Generic tool permission "Allow X tool?"
+    r")",
     re.IGNORECASE,
 )
 
-# NEVER auto-answer -- dangerous confirmations
+# NEVER auto-answer -- dangerous confirmations (expanded blocklist)
 NEVER_AUTO_APPROVE_RE = re.compile(
-    r"(Which model|Enter.*password|Delete.*\?|Force push|Drop.*table)",
+    r"("
+    r"Which model"
+    r"|Enter.*password"
+    r"|Delete.*\?"
+    r"|Force push"
+    r"|Drop.*table"
+    r"|rm\s+"
+    r"|chmod\b"
+    r"|chown\b"
+    r"|git\s+reset"
+    r"|git\s+push.*force"
+    r"|curl\s.*\|"
+    r"|pip\s+install"
+    r"|npm\s+install"
+    r"|ssh-keygen"
+    r"|sudo\b"
+    r"|mkfs\b"
+    r"|dd\s+if="
+    r"|>/dev/"
+    r"|truncate\b"
+    r"|shred\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -140,6 +171,10 @@ _agent_jsonl_map: dict[str, str] = {}  # agent_name -> active JSONL path
 _jsonl_map_refresh_ts: float = 0.0     # last time we refreshed the map
 JSONL_MAP_REFRESH_S = 300              # refresh agent→JSONL mapping every 5 min
 
+# Queue depth alerting
+QUEUE_DEPTH_LIMIT = 20                 # alert when any agent queue exceeds this
+QUEUE_CHECK_INTERVAL_S = 120           # check queue depth every 2 minutes
+
 # -- Configurable Paths -------------------------------------------------------
 
 HOME = Path.home()
@@ -160,7 +195,7 @@ TEAMS_CONFIG = Path(
     os.environ.get("SOUL_TEAM_CONFIG", str(HOME / ".soul" / "team-config.json"))
 )
 SOUL_TEAM_TOML = Path(
-    os.environ.get("SOUL_TEAM_TOML", str(HOME / ".soul" / "soul-team.toml"))
+    os.environ.get("SOUL_TEAM_TOML", str(HOME / ".claude" / "config" / "soul-team.toml"))
 )
 BRIDGE_SCRIPT = Path(
     os.environ.get("SOUL_BRIDGE_SCRIPT", str(HOME / ".soul" / "soul-bridge.py"))
@@ -175,6 +210,23 @@ SOUL_MSG = Path(
 MACHINES_JSON = Path(
     os.environ.get("SOUL_MACHINES_JSON", str(HOME / ".soul" / "machines.json"))
 )
+QUEUE_DIR = HOME / ".clawteam" / "teams" / "soul-team" / "queue"
+
+# Valid agent names — only these are allowed in DB writes
+VALID_AGENTS = frozenset({
+    "pepper", "xavier", "hawkeye", "fury", "loki",
+    "happy", "shuri", "stark", "banner", "friday", "team-lead", "system",
+    "unknown",  # sentinel for when agent name can't be determined from process args
+})
+
+def _is_valid_agent(name: str) -> bool:
+    """Check if agent name is in the known valid agent set.
+
+    Strict validation: only names in VALID_AGENTS are accepted.
+    Update VALID_AGENTS when adding new agents to the team.
+    """
+    return bool(name) and name in VALID_AGENTS
+
 
 _machines_config: dict[str, dict] = {}
 
@@ -198,7 +250,8 @@ def now_iso() -> str:
 
 
 def now_date() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    # Use local time (IST) for daily boundaries — matches when the user's "day" resets
+    return datetime.now().date().isoformat()
 
 
 def log(msg: str, level: str = "INFO") -> None:
@@ -224,10 +277,33 @@ def err(msg: str) -> None:
 
 # -- Database -----------------------------------------------------------------
 
+_db_lock = threading.Lock()
+
+
+def _retry_on_busy(func):
+    """Decorator: acquires _db_lock and retries on SQLITE_BUSY (3 attempts, 100ms backoff)."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        last_err = None
+        for attempt in range(3):
+            try:
+                with _db_lock:
+                    return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() or "busy" in str(e).lower():
+                    last_err = e
+                    time.sleep(0.1 * (attempt + 1))
+                else:
+                    raise
+        raise last_err  # type: ignore[misc]
+    return wrapper
+
+
 def db_connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -278,6 +354,7 @@ def db_init(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@_retry_on_busy
 def db_log_heal(conn: sqlite3.Connection, agent: str, event_type: str,
                 trigger: str, details: str = "") -> None:
     conn.execute(
@@ -288,6 +365,7 @@ def db_log_heal(conn: sqlite3.Connection, agent: str, event_type: str,
     conn.commit()
 
 
+@_retry_on_busy
 def db_log_memory_audit(conn: sqlite3.Connection, agent: str,
                         trigger: str, total: int, saved: int,
                         unsaved: int, passed: bool, details: str = "") -> None:
@@ -300,6 +378,7 @@ def db_log_memory_audit(conn: sqlite3.Connection, agent: str,
     conn.commit()
 
 
+@_retry_on_busy
 def db_upsert_token_usage(conn: sqlite3.Connection, agent: str,
                           input_tok: int, output_tok: int,
                           cache_tok: int, cost: float, ctx_pct: float) -> None:
@@ -333,30 +412,23 @@ def db_today_total_spend(conn: sqlite3.Connection) -> float:
 
 # -- Config Loaders -----------------------------------------------------------
 
+def _load_toml_agents() -> list[dict]:
+    """Load [[agents]] list from soul-team.toml using stdlib tomllib."""
+    try:
+        with open(SOUL_TEAM_TOML, "rb") as f:
+            data = tomllib.load(f)
+        return data.get("agents", [])
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+
+
 def load_agent_models() -> dict[str, str]:
     """Load agent -> model mapping from soul-team.toml."""
-    models: dict[str, str] = {}
-    try:
-        content = SOUL_TEAM_TOML.read_text()
-        # Simple TOML parser for [[agents]] sections (avoid toml dep)
-        current_name = None
-        current_model = None
-        for line in content.splitlines():
-            line = line.strip()
-            if line == "[[agents]]":
-                if current_name and current_model:
-                    models[current_name] = current_model
-                current_name = None
-                current_model = None
-            elif line.startswith("name ="):
-                current_name = line.split("=", 1)[1].strip().strip('"')
-            elif line.startswith("model ="):
-                current_model = line.split("=", 1)[1].strip().strip('"')
-        if current_name and current_model:
-            models[current_name] = current_model
-    except OSError:
-        pass
-    return models
+    return {
+        a["name"]: a.get("model", "sonnet")
+        for a in _load_toml_agents()
+        if "name" in a
+    }
 
 
 def load_team_config() -> list[dict]:
@@ -395,7 +467,7 @@ def build_agent_pane_map() -> dict[str, str]:
             if len(parts) == 2:
                 pane_id, title = parts
                 name = title.strip().lstrip("\u2733 \u2810\u28f7").strip()
-                if name:
+                if name and name != "team-lead":
                     pane_map[name] = pane_id
     except (subprocess.SubprocessError, OSError):
         pass
@@ -415,6 +487,7 @@ class AgentState:
         self.machine = machine
         self.last_output_hash = ""
         self.last_compact_ts = 0.0
+        self.compacted_this_session = False  # True after first compact — prevents re-firing
         self.msg_count = 0
         self.status = "active"  # active | idle | stuck | crashed | unreachable | idle_shutdown
         self.restart_timestamps: list[float] = []  # last N restart times
@@ -443,27 +516,71 @@ def capture_pane(pane_id: str, lines: int = 50) -> str:
         return ""
 
 
-def send_keys(pane_id: str, keys: str) -> bool:
-    """Send key sequence to a tmux pane. Returns True on success."""
+class _PaneLock:
+    """Cross-process file lock for tmux pane writes.
+
+    Uses fcntl.flock on /tmp/soul-pane-{pane_id}.lock to prevent
+    interleaved writes from guardian and courier to the same pane.
+    """
+
+    def __init__(self, pane_id: str):
+        # Sanitize pane_id for filename (e.g. %5 -> _5)
+        safe_id = pane_id.replace("%", "_").replace("/", "_")
+        self._path = f"/tmp/soul-pane-{safe_id}.lock"
+        self._fd = None
+
+    def __enter__(self):
+        self._fd = open(self._path, "w")
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            self._fd.close()
+            self._fd = None
+        return False
+
+
+def send_keys(pane_id: str, text: str) -> bool:
+    """Send literal text to a tmux pane via send-keys -l.
+
+    Uses the -l flag to prevent tmux from interpreting special key sequences
+    (e.g., C-c, Enter). For actual key sequences, use send_raw_keys().
+    Acquires cross-process pane lock to prevent interleaved writes.
+    """
     try:
-        r = subprocess.run(
-            ["tmux", "send-keys", "-t", pane_id, keys, ""],
-            capture_output=True, text=True, timeout=5,
-        )
-        return r.returncode == 0
+        with _PaneLock(pane_id):
+            r = subprocess.run(
+                ["tmux", "send-keys", "-l", "-t", pane_id, text],
+                capture_output=True, text=True, timeout=5,
+            )
+            return r.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def send_raw_keys(pane_id: str, keys: str) -> bool:
+    """Send raw key sequences to a tmux pane (NO -l flag).
+
+    Use this for actual key sequences like 'Enter', 'C-c', 'Escape'.
+    For literal text injection, use send_keys() instead.
+    Acquires cross-process pane lock to prevent interleaved writes.
+    """
+    try:
+        with _PaneLock(pane_id):
+            r = subprocess.run(
+                ["tmux", "send-keys", "-t", pane_id, keys],
+                capture_output=True, text=True, timeout=5,
+            )
+            return r.returncode == 0
     except (subprocess.SubprocessError, OSError):
         return False
 
 
 def send_enter(pane_id: str) -> bool:
-    try:
-        r = subprocess.run(
-            ["tmux", "send-keys", "-t", pane_id, "", "Enter"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return r.returncode == 0
-    except (subprocess.SubprocessError, OSError):
-        return False
+    """Send Enter key to a tmux pane."""
+    return send_raw_keys(pane_id, "Enter")
 
 
 def pane_last_line(output: str) -> str:
@@ -541,7 +658,9 @@ def find_heaviest_claude_pid() -> tuple[int, str]:
                 parts = line.split()
                 pid = int(parts[0])
                 m = re.search(r"--agent[- ](\w+)", line)
-                name = m.group(1) if m else "unknown"
+                name = m.group(1).lower() if m else "unknown"
+                if not _is_valid_agent(name):
+                    name = "unknown"
                 return pid, name
     except (subprocess.SubprocessError, OSError, ValueError):
         pass
@@ -565,7 +684,9 @@ def find_newest_claude_pid() -> tuple[int, str]:
             except ValueError:
                 continue
             m = re.search(r"--agent[- ](\w+)", line)
-            name = m.group(1) if m else "unknown"
+            name = m.group(1).lower() if m else "unknown"
+            if not _is_valid_agent(name):
+                name = "unknown"
             candidates.append((pid, name))
         if candidates:
             return max(candidates, key=lambda x: x[0])
@@ -597,6 +718,26 @@ def notify_ceo(message: str) -> bool:
         return False
 
 
+def check_queue_depth(dry_run: bool = False) -> None:
+    """Check courier queue depth for each agent. Alert when > QUEUE_DEPTH_LIMIT."""
+    if not QUEUE_DIR.is_dir():
+        return
+    for queue_file in QUEUE_DIR.glob("*.json"):
+        agent_name = queue_file.stem
+        try:
+            data = json.loads(queue_file.read_text())
+            if not isinstance(data, list):
+                continue
+            depth = len(data)
+            if depth > QUEUE_DEPTH_LIMIT:
+                msg = f"[queue-depth] {agent_name}: {depth} messages (limit {QUEUE_DEPTH_LIMIT})"
+                warn(msg)
+                if not dry_run:
+                    notify_ceo(msg)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+
 # -- Agent Launch Command -----------------------------------------------------
 
 def build_launch_cmd(agent_name: str, model: str, machine: str) -> list[str] | None:
@@ -608,6 +749,11 @@ def build_launch_cmd(agent_name: str, model: str, machine: str) -> list[str] | N
     (SOUL_MACHINES_JSON). For local agents, optionally wraps with systemd-run
     into a cgroup slice.
     """
+    # Validate agent name to prevent shell injection via crafted names
+    if not re.match(r'^[a-z][a-z0-9-]*$', agent_name):
+        err(f"Invalid agent name: {agent_name!r}")
+        return None
+
     claude_bin = str(HOME / ".local" / "share" / "claude" / "claude")
     # Find actual versioned binary
     versions_dir = HOME / ".local" / "share" / "claude" / "versions"
@@ -623,6 +769,14 @@ def build_launch_cmd(agent_name: str, model: str, machine: str) -> list[str] | N
     }
     model_str = model_map.get(model, model)
 
+    # Dev agents (shuri, happy) load additional code conventions
+    DEV_AGENTS = {"shuri", "happy"}
+    dev_flag = ""
+    if agent_name in DEV_AGENTS:
+        dev_md = HOME / ".claude" / "CLAUDE-dev.md"
+        if dev_md.exists():
+            dev_flag = f" --append-system-prompt-file {dev_md}"
+
     base_cmd = (
         f"cd {HOME} && "
         f"env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 "
@@ -631,8 +785,9 @@ def build_launch_cmd(agent_name: str, model: str, machine: str) -> list[str] | N
         f"--agent-name {agent_name} "
         f"--team-name {TEAM_NAME} "
         f"--agent-type {agent_name} "
-        f"--dangerously-skip-permissions "
+        f"--permission-mode bypassPermissions "
         f"--model {model_str}"
+        f"{dev_flag}"
     )
 
     # Check if this machine is a remote target from config
@@ -645,9 +800,12 @@ def build_launch_cmd(agent_name: str, model: str, machine: str) -> list[str] | N
         return ["ssh"] + ssh_args + [ssh_target, base_cmd]
 
     # Local -- wrap with systemd-run into cgroup slice (if available)
+    # NOTE: base_cmd starts with "cd ..." which is a shell builtin, not an
+    # executable.  systemd-run -- cd ... fails with "Failed to find executable
+    # cd".  Wrapping in bash -c solves this.
     cgroup_cmd = (
         f"systemd-run --user --scope --slice=soul-agents.slice "
-        f"-- {base_cmd}"
+        f"-- bash -c {shlex.quote(base_cmd)}"
     )
     return ["bash", "-c", cgroup_cmd]
 
@@ -672,6 +830,10 @@ def maybe_restart_agent(
     If so, re-launch up to MAX_RESTARTS_PER_HOUR per hour.
     Returns True if restart was triggered.
     """
+    # Don't restart agents that were intentionally paused (e.g., spend cap)
+    if state.status == "paused":
+        return False
+
     output = capture_pane(state.pane_id, lines=10)
     last = pane_last_line(output)
 
@@ -724,6 +886,7 @@ def maybe_restart_agent(
         state.restart_timestamps.append(now_ts)
         _last_restart_ts = now_ts  # Update global stagger timestamp
         state.status = "active"
+        state.compacted_this_session = False  # Reset compact flag on restart
         db_log_heal(
             conn, state.name, "restart", "shell_prompt",
             f"last_line={last!r:.80} restart_count={count + 1}"
@@ -865,11 +1028,12 @@ def maybe_compact_agent(
 ) -> bool:
     """
     Send /compact if context warning detected or msg_count threshold exceeded.
-    Respects per-agent cooldown.
+    Only fires once per session.
     """
-    now = time.time()
-    if now - state.last_compact_ts < COMPACT_COOLDOWN_S:
+    if state.compacted_this_session:
         return False
+
+    now = time.time()
 
     output = capture_pane(state.pane_id, lines=50)
     trigger = None
@@ -906,6 +1070,7 @@ def maybe_compact_agent(
     send_keys(state.pane_id, "/compact")
     send_enter(state.pane_id)
     state.last_compact_ts = time.time()
+    state.compacted_this_session = True
     db_log_heal(conn, state.name, "compact", trigger)
 
     # Schedule memory audit after compact settles
@@ -927,10 +1092,11 @@ def check_context_budget(
     If >= CONTEXT_EARLY_COMPACT_PCT (70%), trigger early compact.
     Returns True if compact was triggered.
     """
-    # Skip if we just compacted (respect cooldown)
-    now = time.time()
-    if now - state.last_compact_ts < COMPACT_COOLDOWN_S:
+    # Only compact once per session — prevents repeated 70% triggers
+    if state.compacted_this_session:
         return False
+
+    now = time.time()
 
     output = capture_pane(state.pane_id, lines=50)
     if not output.strip():
@@ -980,6 +1146,7 @@ def check_context_budget(
         send_keys(state.pane_id, "/compact")
         send_enter(state.pane_id)
         state.last_compact_ts = time.time()
+        state.compacted_this_session = True
         db_log_heal(conn, state.name, "compact", trigger)
 
         # Schedule memory audit after compact settles
@@ -1013,7 +1180,7 @@ _last_wake_ts: dict[str, float] = {}  # agent -> last wake timestamp
 
 # Inbox paths for inotify / poll
 _INBOX_DIR = HOME / "soul-roles" / "shared" / "inbox"
-_COURIER_QUEUE_DIR = HOME / ".local" / "share" / "soul-team" / "teams" / TEAM_NAME / "inboxes"
+_COURIER_QUEUE_DIR = HOME / ".clawteam" / "teams" / TEAM_NAME / "queue"
 
 
 def is_hot_period() -> bool:
@@ -1033,15 +1200,21 @@ def is_hot_period() -> bool:
 
 
 def has_pending_messages(agent: str) -> bool:
-    """Check if agent has unprocessed inbox files or queued courier messages."""
-    # Filesystem inbox
+    """Check if agent has unprocessed inbox files or queued courier messages.
+
+    Checks three locations:
+    1. Spec inbox: ~/soul-roles/shared/inbox/{agent}/
+    2. Courier queue: ~/.clawteam/teams/{team}/queue/{agent}.json
+    3. Clawteam inbox: ~/.clawteam/teams/{team}/inboxes/{agent}_{agent}/
+    """
+    # Spec/role inbox (soul-roles/shared/inbox)
     inbox = _INBOX_DIR / agent
     if inbox.is_dir():
         for f in inbox.iterdir():
             if f.suffix in (".md", ".json", ".txt") and f.stat().st_size > 0:
                 return True
 
-    # Courier queue
+    # Courier queue (clawteam queue dir)
     queue_file = _COURIER_QUEUE_DIR / f"{agent}.json"
     if queue_file.exists():
         try:
@@ -1050,6 +1223,15 @@ def has_pending_messages(agent: str) -> bool:
                 return True
         except (json.JSONDecodeError, OSError):
             pass
+
+    # Clawteam inbox (per-agent inbox directory)
+    clawteam_inbox = HOME / ".clawteam" / "teams" / TEAM_NAME / "inboxes" / f"{agent}_{agent}"
+    if clawteam_inbox.is_dir():
+        for f in clawteam_inbox.iterdir():
+            if f.suffix in (".md", ".json", ".txt") and f.stat().st_size > 0:
+                # Skip archive subdirectory entries
+                if f.is_file():
+                    return True
 
     return False
 
@@ -1124,7 +1306,7 @@ def idle_shutdown_agent(
     # Step 4: Verify exit — if TUI still showing, force it
     output = capture_pane(state.pane_id, lines=3)
     if not pane_is_shell_prompt(pane_last_line(output)):
-        send_keys(state.pane_id, "C-c")
+        send_raw_keys(state.pane_id, "C-c")
         time.sleep(1)
         send_keys(state.pane_id, "/exit")
         send_enter(state.pane_id)
@@ -1184,7 +1366,7 @@ def wake_agent(
         err(f"[{state.name}] send-keys failed for idle-wake")
         return False
 
-    # Wait for TUI to load (NO trust prompt sleep — dangerously-skip-permissions)
+    # Wait for TUI to load (NO trust prompt sleep — bypassPermissions mode)
     time.sleep(IDLE_WAKE_BOOT_WAIT_S)
 
     # Optimized boot prompt: memory + inbox only, skip daily routine
@@ -1649,22 +1831,9 @@ def check_spend(
     total = db_today_total_spend(conn)
     today = now_date()
 
+    # Log spend but do NOT enforce cap — CEO wants tracking only, no pausing
     if total >= SPEND_CAP_USD:
-        log(f"SPEND CAP HIT: ${total:.2f} >= ${SPEND_CAP_USD:.2f} -- pausing non-critical agents", "WARN")
-        if not dry_run:
-            for name, state in agent_states.items():
-                if name not in CRITICAL_AGENTS:
-                    log(f"[{name}] Pausing (Ctrl+C) -- daily spend cap reached")
-                    send_keys(state.pane_id, "C-c")
-                    state.status = "paused"
-                    db_log_heal(
-                        conn, name, "paused", "spend_cap",
-                        f"total_spend=${total:.2f}"
-                    )
-            notify_ceo(
-                f"[guardian] SPEND CAP ${SPEND_CAP_USD} REACHED (${total:.2f} today). "
-                f"Non-critical agents paused. Resume manually."
-            )
+        log(f"SPEND TRACKING: ${total:.2f} >= ${SPEND_CAP_USD:.2f} (cap disabled, tracking only)", "WARN")
     elif total >= SPEND_ALERT_USD and _spend_alert_sent_date != today:
         log(f"SPEND ALERT: ${total:.2f} >= ${SPEND_ALERT_USD:.2f} (80% of daily cap)", "WARN")
         if not dry_run:
@@ -1887,27 +2056,12 @@ def build_agent_states(agent_models: dict[str, str]) -> dict[str, AgentState]:
     pane_map = build_agent_pane_map()
     states: dict[str, AgentState] = {}
 
-    # Load machine assignments from TOML
-    machine_map: dict[str, str] = {}
-    try:
-        content = SOUL_TEAM_TOML.read_text()
-        current_name = None
-        current_machine = None
-        for line in content.splitlines():
-            line = line.strip()
-            if line == "[[agents]]":
-                if current_name and current_machine:
-                    machine_map[current_name] = current_machine
-                current_name = None
-                current_machine = None
-            elif line.startswith("name ="):
-                current_name = line.split("=", 1)[1].strip().strip('"')
-            elif line.startswith("machine ="):
-                current_machine = line.split("=", 1)[1].strip().strip('"')
-        if current_name and current_machine:
-            machine_map[current_name] = current_machine
-    except OSError:
-        pass
+    # Load machine assignments from TOML (reuse shared loader)
+    machine_map: dict[str, str] = {
+        a["name"]: a.get("machine", "local")
+        for a in _load_toml_agents()
+        if "name" in a
+    }
 
     for name, pane_id in pane_map.items():
         model = agent_models.get(name, "sonnet")
@@ -1948,6 +2102,7 @@ def run_daemon(dry_run: bool = False, once: bool = False) -> None:
     last_token_scan = 0.0
     last_spend_check = 0.0
     last_idle_check = 0.0
+    last_queue_check = 0.0
 
     # Start inbox watcher thread for idle-wake
     inbox_watcher = InboxWatcherThread(agent_states, conn, dry_run=dry_run)
@@ -2040,6 +2195,11 @@ def run_daemon(dry_run: bool = False, once: bool = False) -> None:
             if now - last_spend_check >= SPEND_INTERVAL_S:
                 check_spend(agent_states, conn, dry_run=dry_run)
                 last_spend_check = now
+
+            # -- Queue depth check -- every 120s
+            if now - last_queue_check >= QUEUE_CHECK_INTERVAL_S:
+                check_queue_depth(dry_run=dry_run)
+                last_queue_check = now
 
         except Exception as e:
             err(f"Guardian loop error (iteration {iteration}): {e}")

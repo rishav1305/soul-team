@@ -1,13 +1,4 @@
-"""Soul Courier — single daemon managing message delivery for all agents.
-
-The CourierDaemon is the main orchestrator. It watches agent inbox
-directories for new messages, formats them, injects them into tmux
-panes, and manages retry queues, health checks, and CEO notifications.
-
-All paths are derived from environment variables or Path.home() so the
-daemon works on any machine without hardcoded paths.
-"""
-
+"""Soul Courier — Single daemon managing message delivery for all agents."""
 import fcntl
 import json
 import logging
@@ -24,20 +15,22 @@ from watchdog.observers import Observer
 from soul_courier.formatter import MessageFormatter
 from soul_courier.pane import PaneManager
 from soul_courier.queue import MessageQueue
+from soul_courier.status import StatusStore
 from soul_courier.watcher import InboxWatcher
 
 log = logging.getLogger("soul-courier")
 
 TEAM_NAME = os.environ.get("SOUL_TEAM_NAME", "soul-team")
+MAX_RETRIES = int(os.environ.get("SOUL_COURIER_MAX_RETRIES", "10"))
 TEAM_DIR = Path.home() / ".clawteam" / "teams" / TEAM_NAME
+DND_FLAG = TEAM_DIR / "dnd-team-lead"
 PANES_FILE = TEAM_DIR / "panes.json"
 NATIVE_INBOX_DIR = Path.home() / ".claude" / "teams" / TEAM_NAME / "inboxes"
 
-# Configurable path for CEO action queue file.
-# Default: ~/soul-roles/shared/briefs/ceo-action-queue.md
-ACTION_QUEUE_DIR = Path(
-    os.environ.get("SOUL_ACTION_QUEUE_DIR", str(Path.home() / "soul-roles" / "shared" / "briefs"))
-)
+# Agents that receive messages via file only (no tmux pane injection).
+# team-lead's hidden pane is a bare bash shell — injected text gets
+# executed as commands. File-only delivery avoids this entirely.
+FILE_ONLY_AGENTS = {"team-lead"}
 
 
 class CourierDaemon:
@@ -57,8 +50,9 @@ class CourierDaemon:
         self.pane_mgr = PaneManager(panes)
         self.queue = MessageQueue(team_dir / "queue")
         self.queue.load()
+        self.status = StatusStore(team_dir / "status")
 
-        # Seen tracking -- per-agent sets for scoped deduplication
+        # Seen tracking — per-agent sets for scoped deduplication
         self._sidecar_dir = team_dir / "sidecar"
         self._sidecar_dir.mkdir(parents=True, exist_ok=True)
         self._seen: dict[str, set[str]] = {}
@@ -73,8 +67,11 @@ class CourierDaemon:
         self._last_ceo_notify: dict[str, float] = {}
 
         # Action queue for team-lead
-        self._action_queue_path = ACTION_QUEUE_DIR / "ceo-action-queue.md"
+        self._action_queue_path = Path.home() / "soul-roles" / "shared" / "briefs" / "ceo-action-queue.md"
         self._action_queue_lock = threading.Lock()
+
+        # File-only delivery log for team-lead (human-readable message log)
+        self._file_delivery_log = team_dir / "delivery-log-team-lead.jsonl"
 
         # Observer
         self._observer: Optional[Observer] = None
@@ -99,8 +96,8 @@ class CourierDaemon:
     def _is_seen(self, agent: str, msg_file: Path) -> bool:
         """Check if a message has been seen by a specific agent.
 
-        Seen tracking is per-agent so that a message in one agent's inbox
-        being marked seen does not affect another agent's seen set.
+        Seen tracking is per-agent so that a message in fury's inbox
+        being marked seen does not affect hawkeye's seen set.
         """
         msg_id = msg_file.stem
         return msg_id in self._seen.get(agent, set())
@@ -148,11 +145,12 @@ class CourierDaemon:
     def _mirror_native(self, msg_file: Path, agent: str) -> None:
         """Mirror message to native inbox (team-lead only).
 
-        Writes JSON array format matching existing convention.
+        Writes JSON array format matching existing soul-bridge convention.
         Uses file locking to prevent corruption from concurrent writes.
         """
         if agent != "team-lead":
             return
+        import fcntl
 
         native_file = NATIVE_INBOX_DIR / "team-lead.json"
         native_file.parent.mkdir(parents=True, exist_ok=True)
@@ -245,14 +243,19 @@ class CourierDaemon:
                 self._action_queue_path.parent.mkdir(parents=True, exist_ok=True)
                 header = (
                     f"# CEO Action Queue\n"
-                    f"*Last updated: {time.strftime('%Y-%m-%d %H:%M')}*\n\n"
+                    f"*Last updated: {time.strftime('%Y-%m-%d %H:%M IST')}*\n\n"
                     f"## Pending\n{line}\n"
                     f"## Resolved\n"
                 )
                 self._action_queue_path.write_text(header)
 
     def _inject_action_reminder(self) -> None:
-        """Inject a compact pending actions summary into team-lead pane."""
+        """Write pending actions summary to delivery log (file-based, no pane injection).
+
+        Previously injected into team-lead's tmux pane, which caused bash to
+        execute the reminder text. Now writes to the JSONL delivery log and
+        native inbox instead.
+        """
         with self._action_queue_lock:
             if not self._action_queue_path.exists():
                 return
@@ -262,21 +265,27 @@ class CourierDaemon:
         if not pending:
             return
 
-        parts = [f"\u2501\u2501\u2501 {len(pending)} PENDING ACTIONS \u2501\u2501\u2501"]
+        parts = [f"━━━ {len(pending)} PENDING ACTIONS ━━━"]
         for i, item in enumerate(pending, 1):
             match = re.search(r'\*\*(.+?)\*\*', item)
             summary = match.group(1) if match else item[6:].split(" | ")[0]
             parts.append(f" {i}. {summary}")
-        parts.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+        parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━")
 
         reminder = "\n".join(parts)
-        lock = self.pane_mgr.locks.get("team-lead")
-        if lock:
-            with lock:
-                if not self.pane_mgr.inject("team-lead", reminder):
-                    log.warning("Failed to inject action reminder into team-lead pane")
-        else:
-            log.warning("No pane lock for team-lead -- skipping action reminder")
+        # Write to delivery log instead of pane injection
+        try:
+            log_entry = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "from": "courier",
+                "content": reminder,
+                "priority": "info",
+                "file": "action-reminder",
+            }
+            with open(self._file_delivery_log, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except OSError:
+            log.warning("Failed to write action reminder to delivery log")
 
     def _reminder_loop(self) -> None:
         """Periodically remind team-lead of pending action items."""
@@ -290,18 +299,83 @@ class CourierDaemon:
                 time.sleep(10)
             self._inject_action_reminder()
 
+    def _deliver_file_only(self, agent: str, msg_file: Path) -> bool:
+        """Deliver a message via file only — no tmux pane injection.
+
+        Used for FILE_ONLY_AGENTS (e.g. team-lead) whose pane is a bare
+        bash shell that would execute injected text as commands.
+
+        Delivery path:
+        1. Mirror to native inbox (JSON array for soul-bridge compat)
+        2. Append to JSONL delivery log (human-readable audit trail)
+        3. Archive + mark seen
+        4. Track action items if flagged
+        5. Send receipt to sender
+        """
+        if not msg_file.exists():
+            return False
+
+        try:
+            msg_data = json.loads(msg_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            log.warning("Cannot read message %s", msg_file)
+            return False
+
+        # Mirror to native inbox
+        self._mirror_native(msg_file, agent)
+
+        # Append to JSONL delivery log
+        try:
+            log_entry = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "from": msg_data.get("from", "unknown"),
+                "content": msg_data.get("content", ""),
+                "priority": msg_data.get("key", "normal"),
+                "file": msg_file.name,
+            }
+            with open(self._file_delivery_log, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except OSError:
+            log.warning("Cannot write delivery log for %s", msg_file.name)
+
+        # Archive + mark seen
+        self._archive(msg_file)
+        self._mark_seen(msg_file)
+
+        # Track action items
+        if msg_data.get("action_required"):
+            self._append_action_queue(msg_data)
+
+        # Send receipt to sender
+        sender = msg_data.get("from", "")
+        if sender:
+            self._send_receipt(sender, agent)
+
+        self.status.record(agent, msg_file, "delivered", sender=sender)
+        log.info("File-only delivery to %s: %s (from: %s)", agent, msg_file.name, sender)
+        return True
+
     def _deliver(self, agent: str, msg_file: Path) -> bool:
         """Deliver a single message to an agent's tmux pane.
 
         Core delivery logic:
-        1. Detect pane state
-        2. Handle P1 interrupt if urgent + busy
-        3. Format and inject message
-        4. Verify injection
-        5. Archive + mark seen on success
-        6. Queue on failure with backoff
+        1. Check DND for team-lead (queue silently if active)
+        2. Detect pane state
+        3. Handle P1 interrupt if urgent + busy
+        4. Format and inject message
+        5. Verify injection
+        6. Archive + mark seen on success
+        7. Queue on failure with backoff
         """
         if not msg_file.exists():
+            return False
+
+        # DND mode: check per-agent DND flag, queue silently if active
+        agent_dnd_flag = TEAM_DIR / f"dnd-{agent}"
+        if agent_dnd_flag.exists():
+            self.queue.add(agent, msg_file)
+            self.status.record(agent, msg_file, "queued")
+            log.info("DND active — queued for %s: %s", agent, msg_file.name)
             return False
 
         state = self.pane_mgr.detect_state(agent)
@@ -310,6 +384,35 @@ class CourierDaemon:
         except (json.JSONDecodeError, OSError):
             log.warning("Cannot read message %s", msg_file)
             return False
+
+        # Org routing: domain leads (pepper, fury, loki, shuri) + xavier can message
+        # team-lead directly. Leaf agents (happy, hawkeye, stark, banner) get
+        # redirected to their domain lead. Nothing lost, just rerouted.
+        # Skip redirect for courier-generated messages.
+        if agent == "team-lead":
+            sender = msg_data.get("from", "")
+            is_courier_msg = "courier" in msg_file.name or msg_data.get("type") in ("receipt", "alert", "health")
+            if not is_courier_msg:
+                LEAF_TO_LEAD = {
+                    "hawkeye": "loki",
+                    "happy": "shuri",
+                    "stark": "fury",
+                    "banner": "fury",
+                }
+                redirect_to = LEAF_TO_LEAD.get(sender)
+                if redirect_to:
+                    redirect_inbox = self.team_dir / "inboxes" / f"{redirect_to}_{redirect_to}" / "new"
+                    redirect_inbox.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    shutil.copy2(str(msg_file), str(redirect_inbox / msg_file.name))
+                    self._archive(msg_file)
+                    log.info("Org redirect: %s→team-lead copied to %s inbox", sender, redirect_to)
+                    return True
+
+        # File-only agents: skip pane injection entirely
+        if agent in FILE_ONLY_AGENTS:
+            return self._deliver_file_only(agent, msg_file)
+
         priority = msg_data.get("key", "normal")
 
         # P1 interrupt
@@ -332,31 +435,48 @@ class CourierDaemon:
                     )
 
                 if not self.dry_run and self.pane_mgr.inject(agent, text):
+                    # inject() succeeded — archive and mark seen immediately to prevent
+                    # re-delivery loops. verify_injection is best-effort only: if the
+                    # agent processes the message before the 2s verify window, the
+                    # fragment may already be scrolled out of the captured pane content,
+                    # causing a false-negative that would re-queue an already-delivered
+                    # message (Friday / Loki re-delivery loop, Mar 24).
+                    self._archive(msg_file)
+                    self._mark_seen(msg_file)
+                    self._mirror_native(msg_file, agent)
+                    self._backoff.pop(agent, None)
+                    self._fail_count.pop(agent, None)
+                    # Track action items for team-lead
+                    if agent == "team-lead" and msg_data.get("action_required"):
+                        self._append_action_queue(msg_data)
+                    # Send delivery receipt to sender's pane
+                    sender = msg_data.get("from", "")
+                    if sender:
+                        self._send_receipt(sender, agent)
+                    # Record delivered status
+                    self.status.record(agent, msg_file, "delivered", sender=sender)
+                    # Best-effort verify (log only — does NOT gate delivery)
                     from_user = msg_data.get("from", "unknown")
-                    # Use [from_user] as fragment -- works for all format variants
-                    fragment = f"[{from_user}]"
-                    if self.pane_mgr.verify_injection(agent, fragment):
-                        self._archive(msg_file)
-                        self._mark_seen(msg_file)
-                        self._mirror_native(msg_file, agent)
-                        self._backoff.pop(agent, None)
-                        self._fail_count.pop(agent, None)
-                        # Track action items for team-lead
-                        if agent == "team-lead" and msg_data.get("action_required"):
-                            self._append_action_queue(msg_data)
-                        log.info("Delivered to %s: %s", agent, msg_file.name)
-                        return True
+                    if not self.pane_mgr.verify_injection(agent, from_user):
+                        log.warning(
+                            "verify_injection miss for %s:%s (fragment=%r) — "
+                            "message was injected and archived; agent processed it fast",
+                            agent, msg_file.name, from_user,
+                        )
+                    else:
+                        log.info("Delivered+verified to %s: %s", agent, msg_file.name)
+                    return True
 
-                # Failed injection or dry_run
+                # inject() itself failed or dry_run — queue for retry
                 self.queue.add(agent, msg_file)
-                self._increment_fail(agent)
+                self.status.record(agent, msg_file, "failed")
+                self._increment_fail(agent, msg_file=msg_file)
                 return False
 
-            # Not idle -- queue the message
+            # Not idle — queue the message
             self.queue.add(agent, msg_file)
-            if state == "crashed":
-                self._notify_ceo(agent, "crashed")
-            elif state == "dead":
+            self.status.record(agent, msg_file, "queued")
+            if state == "dead":
                 self._notify_ceo(agent, "dead")
             self._mirror_native(msg_file, agent)
             return False
@@ -365,7 +485,9 @@ class CourierDaemon:
         """Send Ctrl+C to interrupt a busy agent for P1 messages.
 
         Has a 30s cooldown per agent to prevent interrupt storms.
-        Tries up to 3 times with 2s sleep between attempts.
+        Tries up to 5 times with 3s sleep between attempts.
+        After each C-c, sends an empty Enter to flush the shell prompt
+        so the state detection can confirm idle more reliably.
         """
         lock_file = self._sidecar_dir / f"{agent}-interrupt.lock"
         if lock_file.exists():
@@ -380,32 +502,112 @@ class CourierDaemon:
         if not pane_id:
             return "dead"
 
-        for _ in range(3):
+        for attempt in range(5):
+            log.debug("P1 interrupt attempt %d/5 for %s", attempt + 1, agent)
             subprocess.run(
                 ["tmux", "send-keys", "-t", pane_id, "C-c"],
                 capture_output=True,
                 timeout=5,
             )
-            time.sleep(2)
+            # Brief pause then send Enter to flush shell prompt after C-c
+            time.sleep(0.5)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", pane_id, "Enter"],
+                capture_output=True,
+                timeout=5,
+            )
+            time.sleep(2.5)
             self.pane_mgr.invalidate_cache(agent)
             state = self.pane_mgr.detect_state(agent)
             if state in ("idle", "crunched"):
                 lock_file.touch()
+                log.info("P1 interrupt succeeded for %s after %d attempt(s)", agent, attempt + 1)
                 return state
+        log.warning("P1 interrupt failed for %s after 5 attempts", agent)
         return "busy"
 
-    def _increment_fail(self, agent: str) -> None:
+    def _send_receipt(self, sender: str, delivered_to: str) -> None:
+        """Inject a delivery receipt into the sender's pane.
+
+        Receipt is a single-line pane injection (not an inbox message).
+        Skipped if sender == delivered_to, sender has no known pane,
+        or sender is a FILE_ONLY_AGENT (receipt logged to file instead).
+        """
+        if sender == delivered_to:
+            return
+        # File-only agents: log receipt to delivery log instead of pane
+        if sender in FILE_ONLY_AGENTS:
+            try:
+                log_entry = {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "from": "courier",
+                    "content": f"[COURIER] ✓ Delivered to {delivered_to}",
+                    "priority": "receipt",
+                    "file": "receipt",
+                }
+                with open(self._file_delivery_log, "a") as f:
+                    f.write(json.dumps(log_entry) + "\n")
+            except OSError:
+                log.debug("Cannot write receipt to delivery log for %s→%s", sender, delivered_to)
+            return
+        if sender not in self.pane_mgr.panes:
+            return
+        receipt_text = f"\n[COURIER] ✓ Delivered to {delivered_to}\n"
+        lock = self.pane_mgr.locks.get(sender)
+        if lock:
+            with lock:
+                if not self.pane_mgr.inject(sender, receipt_text):
+                    log.debug("Receipt inject failed for %s→%s", sender, delivered_to)
+        else:
+            if not self.pane_mgr.inject(sender, receipt_text):
+                log.debug("Receipt inject failed for %s→%s (no lock)", sender, delivered_to)
+
+    def _move_to_dlq(self, agent: str) -> None:
+        """Move all queued messages for agent to the dead letter queue.
+
+        Called when fail_count reaches MAX_RETRIES. Messages are moved
+        (not copied) to team_dir/dlq/{agent}/ and the in-memory queue
+        is drained. CEO is notified with a [DLQ] prefix.
+        """
+        dlq_dir = self.team_dir / "dlq" / agent
+        dlq_dir.mkdir(parents=True, exist_ok=True)
+        moved = 0
+        while self.queue.has_messages(agent):
+            msg = self.queue.pop(agent)
+            if msg and msg.exists():
+                try:
+                    self.status.record(agent, msg, "dlq")
+                    msg.rename(dlq_dir / msg.name)
+                    moved += 1
+                except OSError:
+                    log.warning("Cannot move %s to DLQ", msg)
+        log.error("[DLQ] %d message(s) for %s moved to dead letter queue", moved, agent)
+        self._notify_ceo(agent, f"dlq ({moved} message(s) after {MAX_RETRIES} failed attempts)")
+
+    def _increment_fail(self, agent: str, msg_file: Optional[Path] = None) -> None:
         """Track delivery failures with exponential backoff.
 
-        Backoff starts at 10s and doubles each failure, capped at 120s.
-        Every 5th consecutive failure notifies the CEO.
+        Backoff starts at 5s and doubles each failure, capped at 30s.
+        Notifies the CEO on the 1st failure and every 5th thereafter.
+        After MAX_RETRIES, all pending messages are moved to the DLQ.
+
+        msg_file is the message that failed — used to record status. When
+        not supplied (e.g. called from health check), only fail-count and
+        backoff are updated.
         """
         count = self._fail_count.get(agent, 0) + 1
         self._fail_count[agent] = count
-        self._backoff[agent] = min(10 * (2 ** (count - 1)), 120)
-        if count >= 5 and count % 5 == 0:
-            log.warning("%d consecutive failures for %s", count, agent)
-            self._notify_ceo(agent, f"delivery-failing ({count} attempts)")
+        self._backoff[agent] = min(5 * (2 ** (count - 1)), 30)
+        if count >= MAX_RETRIES:
+            log.error("MAX_RETRIES (%d) reached for %s — moving to DLQ", MAX_RETRIES, agent)
+            if msg_file:
+                self.queue.add(agent, msg_file)
+            self._move_to_dlq(agent)
+            self._fail_count.pop(agent, None)
+            self._backoff.pop(agent, None)
+        elif count == 1 or (count >= 5 and count % 5 == 0):
+            log.warning("%d consecutive failure(s) for %s", count, agent)
+            self._notify_ceo(agent, f"delivery-failing ({count} attempt(s))")
 
     # -- Catch-up ---------------------------------------------------------
 
@@ -414,6 +616,10 @@ class CourierDaemon:
 
         Called once at startup to process any messages that arrived
         while the daemon was not running.
+
+        Messages live in inboxes/{agent}_{agent}/new/msg-*.json (the clawteam
+        CLI and MCP tools write to the new/ subdir). We also check the top-level
+        agent dir for backwards compatibility with any legacy senders.
         """
         inboxes_dir = self.team_dir / "inboxes"
         count = 0
@@ -421,6 +627,14 @@ class CourierDaemon:
             if not agent_dir.is_dir() or agent_dir.name == "agent":
                 continue
             agent = agent_dir.name.split("_")[0]
+            # Primary: messages in new/ subdir (clawteam CLI, MCP tools)
+            new_dir = agent_dir / "new"
+            if new_dir.is_dir():
+                for msg in sorted(new_dir.glob("msg-*.json")):
+                    if not self._is_seen(agent, msg):
+                        self._deliver(agent, msg)
+                        count += 1
+            # Fallback: messages in top-level dir (legacy senders, org redirects)
             for msg in sorted(agent_dir.glob("msg-*.json")):
                 if not self._is_seen(agent, msg):
                     self._deliver(agent, msg)
@@ -478,9 +692,9 @@ class CourierDaemon:
                 log.exception("Health check failed")
 
     def _run_health_check(self) -> None:
-        """Validate pane liveness, restart observer if needed.
+        """Validate pane liveness, kill orphan processes, restart observer.
 
-        Uses `tmux list-panes -s -t <team>` to get all panes across
+        Uses `tmux list-panes -s -t soul-team` to get all panes across
         all windows in the session, then marks dead agents and revives
         any that reappeared.
         """
@@ -497,7 +711,7 @@ class CourierDaemon:
                     "list-panes",
                     "-s",
                     "-t",
-                    TEAM_NAME,
+                    "soul-team",
                     "-F",
                     "#{pane_id}",
                 ],
@@ -523,9 +737,13 @@ class CourierDaemon:
             {a: p for a, p in new_panes.items() if p in live_panes}
         )
 
+        # Kill orphaned legacy processes (migration period)
+        subprocess.run(["pkill", "-f", "soul-sidecar"], capture_output=True)
+        subprocess.run(["pkill", "-f", "soul-bridge"], capture_output=True)
+
         # Verify observer is alive
         if self._observer and not self._observer.is_alive():
-            log.warning("Watchdog observer died -- restarting")
+            log.warning("Watchdog observer died — restarting")
             self._start_observer()
 
         # Flush queues
@@ -599,7 +817,7 @@ class CourierDaemon:
         )
         reminder_thread.start()
 
-        log.info("Soul Courier running -- %d agents", len(self.pane_mgr.panes))
+        log.info("Soul Courier running — %d agents", len(self.pane_mgr.panes))
 
         # Block main thread
         try:

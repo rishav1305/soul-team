@@ -1,0 +1,17 @@
+[Unit]
+Description=Soul Team Message Router
+Documentation=https://github.com/rishav1305/soul-team
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/soul-team
+ExecStart=/usr/bin/python3 %h/soul-team/router/router.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

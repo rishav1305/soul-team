@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# soul-team setup — install soul-team on this machine
+# soul-team setup — clone-and-go installer
 # Safe to re-run (idempotent).
 set -euo pipefail
 
@@ -9,23 +9,23 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-ok()   { echo -e "${GREEN}  ✓ $*${NC}"; }
-warn() { echo -e "${YELLOW}  ⚠ $*${NC}"; }
-fail() { echo -e "${RED}  ✗ $*${NC}"; exit 1; }
+ok()   { echo -e "${GREEN}  [ok] $*${NC}"; }
+warn() { echo -e "${YELLOW}  [!!] $*${NC}"; }
+fail() { echo -e "${RED}  [FAIL] $*${NC}"; exit 1; }
 info() { echo -e "  ${BOLD}$*${NC}"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo ""
 echo -e "${BOLD}soul-team installer${NC}"
-echo "────────────────────────────────────────"
+echo "=========================================="
 echo ""
 
-# ── 1. Check prerequisites ────────────────────────────────────────────────────
+# ── 1. Check prerequisites ──────────────────────────────────────────────────
 
-info "Checking prerequisites…"
+info "Checking prerequisites..."
 
-# tmux ≥ 3.2
+# tmux >= 3.2
 if command -v tmux &>/dev/null; then
     TMUX_VER=$(tmux -V | awk '{print $2}')
     TMUX_MAJOR=$(echo "$TMUX_VER" | cut -d. -f1)
@@ -33,13 +33,13 @@ if command -v tmux &>/dev/null; then
     if [[ "$TMUX_MAJOR" -gt 3 ]] || [[ "$TMUX_MAJOR" -eq 3 && "$TMUX_MINOR" -ge 2 ]]; then
         ok "tmux $TMUX_VER"
     else
-        warn "tmux $TMUX_VER found — soul-team requires ≥ 3.2. Some features may not work."
+        warn "tmux $TMUX_VER found -- soul-team requires >= 3.2. Some features may not work."
     fi
 else
-    fail "tmux not found. Install tmux ≥ 3.2 and re-run."
+    fail "tmux not found. Install tmux >= 3.2 and re-run."
 fi
 
-# python3 ≥ 3.11
+# python3 >= 3.11
 if command -v python3 &>/dev/null; then
     PY_VER=$(python3 --version 2>&1 | awk '{print $2}')
     PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
@@ -47,10 +47,10 @@ if command -v python3 &>/dev/null; then
     if [[ "$PY_MAJOR" -ge 3 && "$PY_MINOR" -ge 11 ]]; then
         ok "Python $PY_VER"
     else
-        warn "Python $PY_VER found — soul-team requires ≥ 3.11. Some features may not work."
+        warn "Python $PY_VER found -- soul-team requires >= 3.11. Some features may not work."
     fi
 else
-    fail "python3 not found. Install Python ≥ 3.11 and re-run."
+    fail "python3 not found. Install Python >= 3.11 and re-run."
 fi
 
 # claude CLI
@@ -65,85 +65,51 @@ if command -v clawteam &>/dev/null; then
     ok "clawteam CLI"
 else
     warn "clawteam not found. Message bus features will be unavailable."
-    warn "  → See: https://github.com/clawteam/clawteam"
+    warn "  -> See: https://github.com/clawteam/clawteam"
 fi
 
 # jq (optional)
 if command -v jq &>/dev/null; then
     ok "jq (optional) found"
 else
-    warn "jq not found — optional, used for panes.json manipulation."
+    warn "jq not found -- optional, used for panes.json manipulation."
 fi
 
 echo ""
 
-# ── 2. Create directories ─────────────────────────────────────────────────────
+# ── 2. Install Python dependencies ──────────────────────────────────────────
 
-info "Creating directories…"
+info "Installing Python dependencies..."
 
-CONFIG_DIR="${HOME}/.config/soul-team"
-DATA_DIR="${HOME}/.local/share/soul-team"
-LOG_DIR="${DATA_DIR}/logs"
-TEAM_DIR="${DATA_DIR}/teams/soul-team"
+DEPS="watchdog psutil"
+if python3 -m pip install --user $DEPS --quiet 2>/dev/null; then
+    ok "$DEPS installed"
+else
+    warn "pip install failed -- trying without --user flag"
+    if python3 -m pip install $DEPS --quiet 2>/dev/null; then
+        ok "$DEPS installed (system)"
+    else
+        warn "Could not install $DEPS. Install manually: pip3 install $DEPS"
+    fi
+fi
+
+echo ""
+
+# ── 3. Symlink bin/* to ~/.local/bin/ ────────────────────────────────────────
+
+info "Symlinking bin scripts -> ~/.local/bin/"
+
 BIN_DIR="${HOME}/.local/bin"
+mkdir -p "$BIN_DIR"
 
-for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$TEAM_DIR" "$BIN_DIR"; do
-    if [[ -d "$dir" ]]; then
-        ok "$dir (exists)"
-    else
-        mkdir -p "$dir"
-        ok "$dir (created)"
+for script in "$SCRIPT_DIR"/bin/*; do
+    BASENAME=$(basename "$script")
+    DEST="${BIN_DIR}/${BASENAME}"
+    if [[ -L "$DEST" ]]; then
+        rm "$DEST"
     fi
-done
-
-echo ""
-
-# ── 3. Copy cluster.yaml.example ─────────────────────────────────────────────
-
-info "Installing configuration…"
-
-CLUSTER_EXAMPLE="${SCRIPT_DIR}/cluster.yaml.example"
-CLUSTER_DEST="${CONFIG_DIR}/cluster.yaml"
-
-if [[ -f "$CLUSTER_DEST" ]]; then
-    warn "cluster.yaml already exists — skipping (will not overwrite)"
-else
-    if [[ -f "$CLUSTER_EXAMPLE" ]]; then
-        cp "$CLUSTER_EXAMPLE" "$CLUSTER_DEST"
-        ok "cluster.yaml installed → $CLUSTER_DEST"
-    else
-        warn "cluster.yaml.example not found in $SCRIPT_DIR — skipping"
-    fi
-fi
-
-echo ""
-
-# ── 4. Install Python dependencies ───────────────────────────────────────────
-
-info "Installing Python dependencies…"
-
-if python3 -m pip install --user PyYAML psutil --quiet; then
-    ok "PyYAML, psutil installed"
-else
-    fail "pip install failed. Try: python3 -m pip install --user PyYAML psutil"
-fi
-
-echo ""
-
-# ── 5. Install bin scripts ────────────────────────────────────────────────────
-
-info "Installing bin scripts → $BIN_DIR"
-
-for script in soul-team soul-msg; do
-    SRC="${SCRIPT_DIR}/bin/${script}"
-    DEST="${BIN_DIR}/${script}"
-    if [[ -f "$SRC" ]]; then
-        cp "$SRC" "$DEST"
-        chmod +x "$DEST"
-        ok "$script"
-    else
-        warn "bin/${script} not found in $SCRIPT_DIR — skipping"
-    fi
+    ln -sf "$script" "$DEST"
+    ok "$BASENAME -> $DEST"
 done
 
 # Ensure ~/.local/bin is on PATH
@@ -155,35 +121,9 @@ fi
 
 echo ""
 
-# ── 6. Install Python packages (courier / guardian) ───────────────────────────
+# ── 4. Copy systemd units to ~/.config/systemd/user/ ────────────────────────
 
-info "Installing daemon packages → $DATA_DIR"
-
-for pkg in courier guardian; do
-    SRC="${SCRIPT_DIR}/${pkg}"
-    DEST="${DATA_DIR}/${pkg}"
-    if [[ -d "$SRC" ]]; then
-        cp -r "$SRC" "$DEST"
-        ok "${pkg}/ copied"
-    elif [[ -f "${SCRIPT_DIR}/${pkg}.py" ]]; then
-        cp "${SCRIPT_DIR}/${pkg}.py" "${DATA_DIR}/${pkg}.py"
-        ok "${pkg}.py copied"
-    else
-        warn "${pkg} not found in $SCRIPT_DIR — skipping"
-    fi
-done
-
-# Copy MCP server if present
-if [[ -d "${SCRIPT_DIR}/mcp-server" ]]; then
-    cp -r "${SCRIPT_DIR}/mcp-server" "${DATA_DIR}/mcp-server"
-    ok "mcp-server/ copied"
-fi
-
-echo ""
-
-# ── 7. Optionally install systemd services ────────────────────────────────────
-
-info "Checking for systemd…"
+info "Installing systemd services..."
 
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 
@@ -191,50 +131,98 @@ if command -v systemctl &>/dev/null && systemctl --user status &>/dev/null 2>&1;
     mkdir -p "$SYSTEMD_USER_DIR"
     INSTALLED_SERVICES=0
 
-    for svc in soul-courier soul-guardian; do
-        SVC_SRC="${SCRIPT_DIR}/systemd/${svc}.service"
-        SVC_DEST="${SYSTEMD_USER_DIR}/${svc}.service"
-        if [[ -f "$SVC_SRC" ]]; then
-            cp "$SVC_SRC" "$SVC_DEST"
-            ok "${svc}.service installed"
-            INSTALLED_SERVICES=$((INSTALLED_SERVICES + 1))
-        else
-            warn "systemd/${svc}.service not found — skipping"
-        fi
+    for svc_file in "$SCRIPT_DIR"/systemd/*.service; do
+        [ -f "$svc_file" ] || continue
+        SVC_NAME=$(basename "$svc_file")
+        cp "$svc_file" "${SYSTEMD_USER_DIR}/${SVC_NAME}"
+        ok "${SVC_NAME} installed"
+        INSTALLED_SERVICES=$((INSTALLED_SERVICES + 1))
     done
 
     if [[ "$INSTALLED_SERVICES" -gt 0 ]]; then
         systemctl --user daemon-reload
         ok "systemd daemon-reload done"
-        warn "Services are installed but NOT enabled by default."
-        warn "  To enable:  systemctl --user enable --now soul-courier soul-guardian"
+        warn "Services installed but NOT enabled by default."
+        warn "  To enable:  systemctl --user enable --now soul-courier soul-guardian soul-router"
     fi
 else
-    warn "systemd user session not available — skipping service installation"
+    warn "systemd user session not available -- skipping service installation"
     warn "  Daemons can be started manually via the soul-team CLI."
 fi
 
 echo ""
 
-# ── 8. Print success summary ──────────────────────────────────────────────────
+# ── 5. Create runtime directories ───────────────────────────────────────────
 
-echo -e "${GREEN}────────────────────────────────────────${NC}"
+info "Creating runtime directories..."
+
+RUNTIME_DIRS=(
+    "${HOME}/.soul"
+    "${HOME}/.soul/preflight"
+    "${HOME}/.soul/health"
+    "${HOME}/.clawteam/teams/soul-team"
+    "${HOME}/.clawteam/teams/soul-team/inboxes"
+    "${HOME}/.clawteam/teams/soul-team/broadcast"
+    "${HOME}/.clawteam/teams/soul-team/discussions"
+    "${HOME}/.clawteam/teams/soul-team/sidecar"
+    "${HOME}/.claude/config"
+    "${HOME}/.claude/logs"
+)
+
+for dir in "${RUNTIME_DIRS[@]}"; do
+    if [[ -d "$dir" ]]; then
+        ok "$dir (exists)"
+    else
+        mkdir -p "$dir"
+        ok "$dir (created)"
+    fi
+done
+
+echo ""
+
+# ── 6. Copy config example if no config exists ──────────────────────────────
+
+info "Installing configuration..."
+
+CONFIG_DEST="${HOME}/.claude/config/soul-team.toml"
+CONFIG_EXAMPLE="${SCRIPT_DIR}/config/soul-team.toml.example"
+
+if [[ -f "$CONFIG_DEST" ]]; then
+    ok "soul-team.toml already exists -- skipping (will not overwrite)"
+else
+    if [[ -f "$CONFIG_EXAMPLE" ]]; then
+        cp "$CONFIG_EXAMPLE" "$CONFIG_DEST"
+        ok "soul-team.toml installed -> $CONFIG_DEST"
+        warn "Edit $CONFIG_DEST to set your SSH targets and agent config."
+    else
+        warn "config/soul-team.toml.example not found -- skipping"
+    fi
+fi
+
+echo ""
+
+# ── 7. Print success summary ────────────────────────────────────────────────
+
+echo -e "${GREEN}==========================================${NC}"
 echo -e "${GREEN}  soul-team installed successfully!${NC}"
-echo -e "${GREEN}────────────────────────────────────────${NC}"
+echo -e "${GREEN}==========================================${NC}"
 echo ""
 echo "  Next steps:"
 echo ""
-echo -e "  1. Edit your cluster config:"
-echo -e "     ${BOLD}${CONFIG_DIR}/cluster.yaml${NC}"
+echo -e "  1. Edit your agent config:"
+echo -e "     ${BOLD}${CONFIG_DEST}${NC}"
 echo ""
 echo -e "  2. Start your agent team:"
 echo -e "     ${BOLD}soul-team${NC}"
 echo ""
 echo -e "  3. Send a message to an agent:"
-echo -e "     ${BOLD}soul-msg <agent-name> \"Hello from the terminal\"${NC}"
+echo -e "     ${BOLD}soul-msg send <agent-name> \"Hello from the terminal\"${NC}"
 echo ""
-echo -e "  4. Optional — run daemons with systemd:"
-echo -e "     ${BOLD}systemctl --user enable --now soul-courier soul-guardian${NC}"
+echo -e "  4. Check team health:"
+echo -e "     ${BOLD}soul-health${NC}"
 echo ""
-echo -e "  Docs: https://github.com/your-org/soul-team"
+echo -e "  5. Optional -- run daemons with systemd:"
+echo -e "     ${BOLD}systemctl --user enable --now soul-courier soul-guardian soul-router${NC}"
+echo ""
+echo -e "  Docs: https://github.com/rishav1305/soul-team"
 echo ""

@@ -1,5 +1,3 @@
-"""Soul Courier — tests for the MessageQueue module."""
-
 import json
 import tempfile
 from pathlib import Path
@@ -100,6 +98,18 @@ def test_peek_thread_batch_none():
     with tempfile.TemporaryDirectory() as td:
         q = MessageQueue(Path(td))
         assert q.peek_thread_batch("fury") is None
+
+def test_add_deduplicates_same_file():
+    """Adding the same Path twice must not enqueue it twice."""
+    with tempfile.TemporaryDirectory() as td:
+        q = MessageQueue(Path(td))
+        msg = Path(td) / "msg-dup.json"
+        msg.write_text('{"content":"dup"}')
+        q.add("fury", msg)
+        q.add("fury", msg)  # second add of same file
+        q.pop("fury")        # removes the only entry
+        assert q.pop("fury") is None  # queue is now empty
+
 
 def test_peek_thread_batch_found():
     with tempfile.TemporaryDirectory() as td:
