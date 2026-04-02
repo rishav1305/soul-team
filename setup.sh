@@ -184,17 +184,26 @@ echo ""
 
 info "Installing configuration..."
 
-CONFIG_DEST="${HOME}/.claude/config/soul-team.toml"
+# Config paths: primary (new) and legacy (backward compat)
+USER_CONFIG_DIR="${HOME}/.soul-team"
+PRIMARY_CONFIG="${USER_CONFIG_DIR}/config.toml"
+LEGACY_CONFIG="${HOME}/.claude/config/soul-team.toml"
 CONFIG_EXAMPLE="${SCRIPT_DIR}/config/soul-team.toml.example"
 NEEDS_INIT=false
 
-if [[ -f "$CONFIG_DEST" ]]; then
-    ok "soul-team.toml already exists -- skipping (will not overwrite)"
+mkdir -p "$USER_CONFIG_DIR"
+
+if [[ -f "$PRIMARY_CONFIG" ]]; then
+    ok "~/.soul-team/config.toml already exists -- skipping (will not overwrite)"
+elif [[ -f "$LEGACY_CONFIG" ]]; then
+    # Migrate legacy config to new location
+    cp "$LEGACY_CONFIG" "$PRIMARY_CONFIG"
+    ok "Migrated legacy config to ~/.soul-team/config.toml"
 else
     NEEDS_INIT=true
     if [[ -f "$CONFIG_EXAMPLE" ]]; then
-        cp "$CONFIG_EXAMPLE" "$CONFIG_DEST"
-        ok "soul-team.toml installed -> $CONFIG_DEST"
+        cp "$CONFIG_EXAMPLE" "$PRIMARY_CONFIG"
+        ok "Config template installed -> $PRIMARY_CONFIG"
         warn "This is a template config. Run 'soul-team init' to customize."
     else
         warn "config/soul-team.toml.example not found -- skipping"

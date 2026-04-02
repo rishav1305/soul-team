@@ -16,7 +16,7 @@ Environment:
     SOUL_TEAM_NAME         tmux session name (default: soul-team)
     SOUL_GUARDIAN_LOG      Path to log file (default: ~/.soul/guardian.log)
     SOUL_TEAM_CONFIG       Path to team config JSON (default: ~/.soul/team-config.json)
-    SOUL_TEAM_TOML         Path to team TOML (default: ~/.claude/config/soul-team.toml)
+    SOUL_TEAM_TOML         Path to team TOML (resolved: $SOUL_TEAM_CONFIG > ~/.soul-team/config.toml > ~/.claude/config/soul-team.toml)
     SOUL_BRIDGE_SCRIPT     Path to bridge daemon script (optional)
     SOUL_MSG_BIN           Path to messaging binary (optional)
     SOUL_CRITICAL_AGENTS   Comma-separated agent names that must never be paused (default: empty)
@@ -194,9 +194,26 @@ TEAM_NAME = os.environ.get("SOUL_TEAM_NAME", "soul-team")
 TEAMS_CONFIG = Path(
     os.environ.get("SOUL_TEAM_CONFIG", str(HOME / ".soul" / "team-config.json"))
 )
-SOUL_TEAM_TOML = Path(
-    os.environ.get("SOUL_TEAM_TOML", str(HOME / ".claude" / "config" / "soul-team.toml"))
-)
+def _resolve_toml_path() -> Path:
+    """Resolve TOML config path: env > ~/.soul-team/ > ~/.claude/config/ > repo example."""
+    env_val = os.environ.get("SOUL_TEAM_TOML") or os.environ.get("SOUL_TEAM_CONFIG")
+    if env_val:
+        p = Path(env_val)
+        if p.exists():
+            return p
+    user_cfg = HOME / ".soul-team" / "config.toml"
+    if user_cfg.exists():
+        return user_cfg
+    legacy_cfg = HOME / ".claude" / "config" / "soul-team.toml"
+    if legacy_cfg.exists():
+        return legacy_cfg
+    # Last resort: repo example (relative to this script)
+    repo_example = Path(__file__).resolve().parent.parent / "config" / "soul-team.toml.example"
+    if repo_example.exists():
+        return repo_example
+    return legacy_cfg  # Fallback to legacy path even if missing
+
+SOUL_TEAM_TOML = _resolve_toml_path()
 BRIDGE_SCRIPT = Path(
     os.environ.get("SOUL_BRIDGE_SCRIPT", str(HOME / ".soul" / "soul-bridge.py"))
 )

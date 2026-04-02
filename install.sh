@@ -71,9 +71,14 @@ fi
 
 # ── 4. Offer interactive setup ──────────────────────────────
 echo ""
-CONFIG_FILE="$HOME/.claude/config/soul-team.toml"
+# Create user config directory
+mkdir -p "$HOME/.soul-team"
 
-if [[ ! -f "$CONFIG_FILE" ]] || [[ ! -s "$CONFIG_FILE" ]]; then
+# Check both new and legacy config locations
+CONFIG_FILE="$HOME/.soul-team/config.toml"
+LEGACY_CONFIG="$HOME/.claude/config/soul-team.toml"
+
+if [[ ! -f "$CONFIG_FILE" ]] && [[ ! -f "$LEGACY_CONFIG" ]]; then
     echo -e "  ${BOLD}No team configuration found.${NC}"
     echo ""
     echo "  Would you like to run the interactive setup wizard?"

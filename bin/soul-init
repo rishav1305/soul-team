@@ -48,14 +48,19 @@ PROTOCOL_SRC = REPO_ROOT / "protocols" / "team-protocol-v2.md"
 SYSTEMD_SRC = REPO_ROOT / "systemd"
 
 HOME = Path.home()
-CLAUDE_CONFIG_DIR = HOME / ".claude" / "config"
+USER_CONFIG_DIR = HOME / ".soul-team"              # Primary config location (never tracked)
+CLAUDE_CONFIG_DIR = HOME / ".claude" / "config"    # Legacy config location (backward compat)
 CLAUDE_AGENTS_DIR = HOME / ".claude" / "agents"
 CLAUDE_LOGS_DIR = HOME / ".claude" / "logs"
 
 
 # ── Data models ──────────────────────────────────────────────────────────────
 
-AVAILABLE_TEMPLATES = ["developer", "researcher", "assistant", "strategist", "writer", "analyst"]
+AVAILABLE_TEMPLATES = [
+    "developer", "researcher", "assistant", "strategist", "writer", "analyst",
+    "pm", "designer", "devops", "qa", "data-engineer", "security",
+    "marketer", "sales", "coach", "finance",
+]
 
 TEMPLATE_DESCRIPTIONS = {
     "developer": "Writes code, runs tests, manages git, plans sprints",
@@ -64,6 +69,16 @@ TEMPLATE_DESCRIPTIONS = {
     "strategist": "Market analysis, competitive intel, GTM planning",
     "writer": "Content creation, copywriting, social media, documentation",
     "analyst": "Data analysis, visualization, ML pipelines, statistics",
+    "pm": "Roadmap planning, sprint tracking, feature prioritization",
+    "designer": "Wireframes, design systems, accessibility, user flows",
+    "devops": "CI/CD, Docker, monitoring, infrastructure, deployment",
+    "qa": "Test planning, E2E testing, regression, bug triage",
+    "data-engineer": "Pipelines, ETL, data modeling, warehousing",
+    "security": "Vulnerability scanning, pentesting, compliance, hardening",
+    "marketer": "Campaigns, SEO, content calendar, analytics, growth",
+    "sales": "Outreach, pipeline management, proposals, CRM",
+    "coach": "Drill sessions, mock interviews, study plans, spaced repetition",
+    "finance": "Budgeting, forecasting, portfolio analysis, risk management",
 }
 
 QUICK_START_TEMPLATES = ["developer", "researcher", "assistant"]
@@ -359,7 +374,7 @@ def _agents_from_templates(config: TeamConfig, num_agents: int) -> None:
             default_name = f"{template}{suffix}"
 
         name = prompt_str(f"Agent {i + 1} name (template: {template})", default=default_name)
-        model = _prompt_model(name)
+        model = _prompt_model(name, template_name=template)
         machine = _prompt_machine(config, name)
 
         agents_list.append(Agent(
@@ -419,7 +434,7 @@ def _agents_mixed(config: TeamConfig, num_agents: int) -> None:
     # Create agents from templates
     for template in selected_templates:
         name = prompt_str(f"Name for {template} agent", default=template)
-        model = _prompt_model(name)
+        model = _prompt_model(name, template_name=template)
         machine = _prompt_machine(config, name)
         agents_list.append(Agent(
             name=name,
@@ -446,8 +461,27 @@ def _agents_mixed(config: TeamConfig, num_agents: int) -> None:
     config.agents = agents_list
 
 
-def _prompt_model(agent_name: str) -> str:
-    """Prompt for model selection."""
+def _get_template_model_default(template_name: Optional[str]) -> str:
+    """Read model_default from a template's frontmatter."""
+    if not template_name:
+        return "sonnet"
+    path = TEMPLATES_DIR / f"{template_name}.md"
+    if not path.exists():
+        return "sonnet"
+    try:
+        content = path.read_text()
+        m = re.search(r"model_default:\s*(\w+)", content)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return "sonnet"
+
+
+def _prompt_model(agent_name: str, template_name: Optional[str] = None) -> str:
+    """Prompt for model selection with template-aware default."""
+    template_default = _get_template_model_default(template_name)
+    default_idx = MODEL_OPTIONS.index(template_default) if template_default in MODEL_OPTIONS else 1
     idx = prompt_choice(
         f"Model for {agent_name}:",
         [
@@ -455,7 +489,7 @@ def _prompt_model(agent_name: str) -> str:
             "sonnet (balanced capability and speed)",
             "haiku (fastest, lowest cost)",
         ],
-        default=1,  # sonnet default
+        default=default_idx,
     )
     return MODEL_OPTIONS[idx]
 
@@ -741,20 +775,20 @@ def write_config(config: TeamConfig) -> list[str]:
 
     section("Generating Configuration")
 
-    # 1. TOML config
-    CLAUDE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    toml_path = CLAUDE_CONFIG_DIR / f"{config.team_name}.toml"
+    # 1. TOML config — primary: ~/.soul-team/config.toml
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     toml_content = generate_toml(config)
-    toml_path.write_text(toml_content)
-    ok(f"Created {toml_path}")
-    created.append(str(toml_path))
+    primary_toml = USER_CONFIG_DIR / "config.toml"
+    primary_toml.write_text(toml_content)
+    ok(f"Created {primary_toml} (primary config)")
+    created.append(str(primary_toml))
 
-    # Also write to the standard soul-team.toml location if team name differs
-    standard_toml = CLAUDE_CONFIG_DIR / "soul-team.toml"
-    if config.team_name != "soul-team":
-        standard_toml.write_text(toml_content)
-        ok(f"Created {standard_toml} (launcher default)")
-        created.append(str(standard_toml))
+    # Also write to legacy location for backward compatibility
+    CLAUDE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    legacy_toml = CLAUDE_CONFIG_DIR / "soul-team.toml"
+    legacy_toml.write_text(toml_content)
+    ok(f"Created {legacy_toml} (legacy compat)")
+    created.append(str(legacy_toml))
 
     # 2. Agent .md files
     CLAUDE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -912,7 +946,7 @@ def print_summary(config: TeamConfig, created: list[str]) -> None:
     info("Next steps:")
     print()
     print(f"    1. Review your config:")
-    print(f"       {BOLD}{CLAUDE_CONFIG_DIR / f'{config.team_name}.toml'}{NC}")
+    print(f"       {BOLD}{USER_CONFIG_DIR / 'config.toml'}{NC}")
     print()
     print(f"    2. Review agent personas:")
     print(f"       {BOLD}{CLAUDE_AGENTS_DIR}/{NC}")
@@ -923,6 +957,393 @@ def print_summary(config: TeamConfig, created: list[str]) -> None:
     print(f"    4. Send a message to an agent:")
     print(f"       {BOLD}soul-msg send <agent-name> \"Hello from the terminal\"{NC}")
     print()
+
+
+# ── TOML config loading (for subcommands) ─────────────────────────────────────
+
+def _resolve_config_path() -> Path:
+    """Resolve the active config file path (same order as bin/soul-team)."""
+    env_val = os.environ.get("SOUL_TEAM_CONFIG")
+    if env_val:
+        p = Path(env_val)
+        if p.exists():
+            return p
+    primary = USER_CONFIG_DIR / "config.toml"
+    if primary.exists():
+        return primary
+    legacy = CLAUDE_CONFIG_DIR / "soul-team.toml"
+    if legacy.exists():
+        return legacy
+    return primary  # Default write target even if missing
+
+
+def _load_toml(path: Path) -> dict:
+    """Load a TOML file using stdlib tomllib."""
+    import tomllib
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _save_toml_from_dict(data: dict, path: Path) -> None:
+    """Write a dict back as TOML.
+
+    We use a minimal TOML serializer since stdlib has no tomllib.dump().
+    This preserves the structure expected by parse_toml.py and the launcher.
+    """
+    lines: list[str] = []
+    lines.append("# Soul Team Configuration")
+    lines.append(f"# Modified by soul-init on {_now()}")
+    lines.append("")
+
+    team = data.get("team", {})
+    if team:
+        lines.append("[team]")
+        for k, v in team.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
+
+    policies = data.get("policies", {})
+    if policies:
+        lines.append("[policies]")
+        for k, v in policies.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
+
+    machines = data.get("machines", [])
+    for m in machines:
+        lines.append("[[machines]]")
+        for k, v in m.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
+
+    agents = data.get("agents", [])
+    for agent in agents:
+        lines.append("[[agents]]")
+        for k, v in agent.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
+
+    layout = data.get("layout", {})
+    if layout:
+        grid = layout.pop("grid", [])
+        lines.append("[layout]")
+        for k, v in layout.items():
+            lines.append(f'{k} = {_toml_value(v)}')
+        lines.append("")
+        for g in grid:
+            lines.append("[[layout.grid]]")
+            for k, v in g.items():
+                lines.append(f'{k} = {_toml_value(v)}')
+            lines.append("")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _toml_value(v) -> str:
+    """Format a Python value as a TOML value."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return f'"{_escape_toml(v)}"'
+    if isinstance(v, list):
+        items = ", ".join(_toml_value(i) for i in v)
+        return f"[{items}]"
+    return f'"{v}"'
+
+
+def _recalculate_layout(data: dict) -> None:
+    """Recalculate layout section based on current agents."""
+    agents = data.get("agents", [])
+    n = len(agents)
+    if n == 0:
+        data.pop("layout", None)
+        return
+    cols = 1 if n <= 3 else (2 if n <= 6 else 3)
+    rows = (n + cols - 1) // cols
+
+    columns: list[list[str]] = [[] for _ in range(cols)]
+    for i, agent in enumerate(agents):
+        columns[i % cols].append(agent.get("name", f"agent-{i}"))
+
+    grid = []
+    for c, col_agents in enumerate(columns):
+        grid.append({"col": c + 1, "agents": col_agents})
+
+    data["layout"] = {
+        "columns": cols + 1,  # CEO + agent columns
+        "rows": rows,
+        "grid": grid,
+    }
+
+
+# ── Subcommands ─────────────────────────────────────────────────────────────
+
+def cmd_add_agent(args: argparse.Namespace) -> None:
+    """Add an agent from a template or interactively."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team init' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+    agents = data.setdefault("agents", [])
+    existing_names = {a["name"] for a in agents}
+
+    if args.custom:
+        # Interactive custom agent
+        name = prompt_str("Agent name")
+        if name in existing_names:
+            fail(f"Agent '{name}' already exists.")
+            sys.exit(1)
+        role = prompt_str("Agent role (one-line description)")
+        model = _prompt_model(name)
+        machine = prompt_str("Machine", default="local")
+        template_name = None
+        if prompt_yn("Base on a template?", default=True):
+            tidx = prompt_choice(
+                "Which template?",
+                [f"{t} -- {TEMPLATE_DESCRIPTIONS[t]}" for t in AVAILABLE_TEMPLATES],
+                default=0,
+            )
+            template_name = AVAILABLE_TEMPLATES[tidx]
+
+        agent_entry = {"name": name, "model": model, "machine": machine, "cgroup": machine == "local"}
+        if template_name:
+            agent_entry["template"] = template_name
+    else:
+        # From template
+        template_name = args.template
+        if template_name not in AVAILABLE_TEMPLATES:
+            available = ", ".join(AVAILABLE_TEMPLATES)
+            fail(f"Unknown template '{template_name}'. Available: {available}")
+            sys.exit(1)
+
+        # Generate unique name
+        base_name = template_name
+        name = base_name
+        suffix = 1
+        while name in existing_names:
+            suffix += 1
+            name = f"{base_name}-{suffix}"
+
+        model = _get_template_model_default(template_name)
+        agent_entry = {
+            "name": name,
+            "model": model,
+            "machine": "local",
+            "cgroup": True,
+            "template": template_name,
+        }
+
+    agents.append(agent_entry)
+    _recalculate_layout(data)
+    _save_toml_from_dict(data, config_path)
+
+    # Generate agent .md file
+    agent_obj = Agent(
+        name=agent_entry["name"],
+        role=TEMPLATE_DESCRIPTIONS.get(agent_entry.get("template", ""), "custom agent"),
+        model=agent_entry["model"],
+        machine=agent_entry["machine"],
+        template=agent_entry.get("template"),
+    )
+    CLAUDE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    agent_md_path = CLAUDE_AGENTS_DIR / f"{agent_entry['name']}.md"
+    agent_md_path.write_text(generate_agent_md(agent_obj))
+
+    ok(f"Added agent '{agent_entry['name']}' (model={agent_entry['model']}, machine={agent_entry['machine']})")
+    ok(f"Config updated: {config_path}")
+    ok(f"Agent persona: {agent_md_path}")
+
+
+def cmd_remove_agent(args: argparse.Namespace) -> None:
+    """Remove an agent by name."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team init' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+    agents = data.get("agents", [])
+    agent_names = [a["name"] for a in agents]
+
+    name = args.name
+    if name not in agent_names:
+        fail(f"Agent '{name}' not found. Current agents: {', '.join(agent_names)}")
+        sys.exit(1)
+
+    data["agents"] = [a for a in agents if a["name"] != name]
+    _recalculate_layout(data)
+    _save_toml_from_dict(data, config_path)
+
+    # Remove agent .md file
+    agent_md = CLAUDE_AGENTS_DIR / f"{name}.md"
+    if agent_md.exists():
+        agent_md.unlink()
+        ok(f"Removed agent persona: {agent_md}")
+
+    ok(f"Removed agent '{name}' from config.")
+    ok(f"Config updated: {config_path}")
+
+
+def cmd_add_machine(args: argparse.Namespace) -> None:
+    """Add a remote machine."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team init' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+    machines = data.setdefault("machines", [])
+    existing_names = {m["name"] for m in machines}
+
+    name = args.name
+    ssh_target = args.ssh
+
+    if name in existing_names:
+        fail(f"Machine '{name}' already exists.")
+        sys.exit(1)
+
+    # Test SSH if requested
+    if not args.no_test:
+        print(f"  Testing SSH to {ssh_target}...", end=" ", flush=True)
+        if test_ssh(ssh_target):
+            print(f"{GREEN}Connected{NC}")
+        else:
+            print(f"{RED}Failed{NC}")
+            warn("SSH test failed. Machine added anyway -- fix SSH and retry.")
+
+    machines.append({"name": name, "ssh": ssh_target})
+    _save_toml_from_dict(data, config_path)
+
+    ok(f"Added machine '{name}' (ssh={ssh_target})")
+    ok(f"Config updated: {config_path}")
+
+
+def cmd_list_agents(args: argparse.Namespace) -> None:
+    """List current agent roster."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team init' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+    agents = data.get("agents", [])
+
+    if not agents:
+        print("  No agents configured.")
+        return
+
+    team_name = data.get("team", {}).get("name", "unnamed")
+    print(f"\n  {BOLD}Team: {team_name} ({len(agents)} agents){NC}\n")
+    print(f"    {'NAME':<20} {'MODEL':<10} {'MACHINE':<15} {'TEMPLATE'}")
+    print(f"    {'─' * 19} {'─' * 9} {'─' * 14} {'─' * 12}")
+    for a in agents:
+        tmpl = a.get("template", "-")
+        print(f"    {a['name']:<20} {a.get('model', 'sonnet'):<10} {a.get('machine', 'local'):<15} {tmpl}")
+    print()
+
+
+def cmd_list_machines(args: argparse.Namespace) -> None:
+    """List configured machines."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team init' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+    machines = data.get("machines", [])
+
+    # Also count agents per machine
+    agents = data.get("agents", [])
+    agent_counts: dict[str, int] = {}
+    for a in agents:
+        m = a.get("machine", "local")
+        agent_counts[m] = agent_counts.get(m, 0) + 1
+
+    print(f"\n  {BOLD}Machines:{NC}\n")
+    print(f"    {'NAME':<20} {'SSH TARGET':<30} {'AGENTS'}")
+    print(f"    {'─' * 19} {'─' * 29} {'─' * 6}")
+    print(f"    {'local':<20} {'(this machine)':<30} {agent_counts.get('local', 0)}")
+    for m in machines:
+        name = m.get("name", "?")
+        ssh = m.get("ssh", "?")
+        print(f"    {name:<20} {ssh:<30} {agent_counts.get(name, 0)}")
+    print()
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    """View or modify config settings."""
+    config_path = _resolve_config_path()
+    if not config_path.exists():
+        fail(f"No config found at {config_path}. Run 'soul-team init' first.")
+        sys.exit(1)
+
+    data = _load_toml(config_path)
+
+    if args.set_value:
+        # Direct config change: key=value
+        key, _, value = args.set_value.partition("=")
+        key = key.strip()
+        value = value.strip()
+
+        if not value:
+            fail(f"Invalid format. Use: --set key=value")
+            sys.exit(1)
+
+        # Map keys to their section
+        team_keys = {"name", "description", "boot_prompt", "stagger_seconds"}
+        policy_keys = {"permission_mode", "agent_memory", "communication", "guardian",
+                       "courier", "idle_shutdown", "idle_timeout_minutes"}
+
+        if key in team_keys:
+            section_name = "team"
+        elif key in policy_keys:
+            section_name = "policies"
+        else:
+            fail(f"Unknown config key '{key}'. Valid keys: {', '.join(sorted(team_keys | policy_keys))}")
+            sys.exit(1)
+
+        section_data = data.setdefault(section_name, {})
+
+        # Type coercion
+        if value.lower() in ("true", "false"):
+            typed_value = value.lower() == "true"
+        elif value.isdigit():
+            typed_value = int(value)
+        else:
+            typed_value = value
+
+        old_value = section_data.get(key, "(unset)")
+        section_data[key] = typed_value
+        _save_toml_from_dict(data, config_path)
+        ok(f"Set [{section_name}] {key} = {typed_value} (was: {old_value})")
+        ok(f"Config updated: {config_path}")
+    else:
+        # Show current config
+        print(f"\n  {BOLD}Config: {config_path}{NC}\n")
+        team = data.get("team", {})
+        if team:
+            print(f"  {CYAN}[team]{NC}")
+            for k, v in team.items():
+                print(f"    {k} = {v}")
+            print()
+
+        policies = data.get("policies", {})
+        if policies:
+            print(f"  {CYAN}[policies]{NC}")
+            for k, v in policies.items():
+                print(f"    {k} = {v}")
+            print()
+
+        agents = data.get("agents", [])
+        print(f"  {CYAN}Agents: {len(agents)}{NC}")
+        for a in agents:
+            print(f"    {a.get('name', '?')} ({a.get('model', 'sonnet')}, {a.get('machine', 'local')})")
+        print()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -937,31 +1358,94 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_sigint)
 
     parser = argparse.ArgumentParser(
-        description="soul-team init — interactive setup wizard",
+        description="soul-team setup and management",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command")
+
+    # ── init (default if no subcommand) ─────────────────────────
+    init_parser = subparsers.add_parser("init", help="Interactive setup wizard")
+    init_parser.add_argument(
         "--quick", action="store_true",
         help="Quick start with defaults (no prompts)",
     )
-    parser.add_argument(
+    init_parser.add_argument(
         "-n", "--num-agents", type=int, default=3,
         help="Number of agents for --quick mode (default: 3)",
     )
-    parser.add_argument(
+    init_parser.add_argument(
         "--config", type=str, default=None,
         help="Path to existing TOML to edit (re-run mode)",
     )
 
+    # ── add-agent ───────────────────────────────────────────────
+    add_agent_parser = subparsers.add_parser("add-agent", help="Add an agent from template or custom")
+    add_agent_parser.add_argument("template", nargs="?", default=None, help="Template name (e.g. developer, qa, security)")
+    add_agent_parser.add_argument("--custom", action="store_true", help="Interactive custom agent (no template)")
+
+    # ── remove-agent ────────────────────────────────────────────
+    remove_agent_parser = subparsers.add_parser("remove-agent", help="Remove an agent by name")
+    remove_agent_parser.add_argument("name", help="Agent name to remove")
+
+    # ── add-machine ─────────────────────────────────────────────
+    add_machine_parser = subparsers.add_parser("add-machine", help="Add a remote machine")
+    add_machine_parser.add_argument("name", help="Machine name (e.g. worker-1)")
+    add_machine_parser.add_argument("ssh", help="SSH target (e.g. user@host)")
+    add_machine_parser.add_argument("--no-test", action="store_true", help="Skip SSH connectivity test")
+
+    # ── list-agents ─────────────────────────────────────────────
+    subparsers.add_parser("list-agents", help="Show current agent roster")
+
+    # ── list-machines ───────────────────────────────────────────
+    subparsers.add_parser("list-machines", help="Show configured machines")
+
+    # ── config ──────────────────────────────────────────────────
+    config_parser = subparsers.add_parser("config", help="View or modify config settings")
+    config_parser.add_argument("--set", dest="set_value", help="Set a config value (key=value)")
+
+    # ── Legacy CLI compat: --quick / -n at top level → init ────
+    parser.add_argument(
+        "--quick", action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "-n", "--num-agents", type=int, default=3,
+        help=argparse.SUPPRESS,
+    )
+
     args = parser.parse_args()
 
+    # Dispatch subcommands
+    if args.command == "add-agent":
+        if not args.template and not args.custom:
+            # Default to --custom if no template specified
+            args.custom = True
+        cmd_add_agent(args)
+        return
+    if args.command == "remove-agent":
+        cmd_remove_agent(args)
+        return
+    if args.command == "add-machine":
+        cmd_add_machine(args)
+        return
+    if args.command == "list-agents":
+        cmd_list_agents(args)
+        return
+    if args.command == "list-machines":
+        cmd_list_machines(args)
+        return
+    if args.command == "config":
+        cmd_config(args)
+        return
+
+    # ── init wizard (default or explicit) ───────────────────────
     banner()
 
-    if args.quick:
-        # Quick start — no prompts
-        info(f"Quick start: creating {args.num_agents}-agent team with defaults...")
+    if args.quick or (args.command == "init" and hasattr(args, "quick") and args.quick):
+        num = args.num_agents if hasattr(args, "num_agents") else 3
+        info(f"Quick start: creating {num}-agent team with defaults...")
         print()
-        config = quick_start(args.num_agents)
+        config = quick_start(num)
         created = write_config(config)
         print_summary(config, created)
         return

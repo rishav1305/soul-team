@@ -13,6 +13,16 @@
 #   soul-team --dry-run                 # Validate config without launching
 #   soul-team --dry-run --agents happy  # Validate specific agent subset
 #
+# Management subcommands (post-setup reconfiguration):
+#   soul-team add-agent developer       # Add agent from template
+#   soul-team add-agent --custom        # Interactive custom agent
+#   soul-team remove-agent developer-1  # Remove an agent
+#   soul-team add-machine worker-2 user@host  # Add remote machine
+#   soul-team list-agents               # Show current roster
+#   soul-team list-machines             # Show machines
+#   soul-team config                    # Show current config
+#   soul-team config --set stagger_seconds=15  # Direct config change
+#
 # Layout adapts dynamically to agent count:
 #   1-3 agents: CEO + 1 column
 #   4-6 agents: CEO + 2 columns
@@ -22,7 +32,7 @@
 # Trust prompt auto-accepted. Boot prompt typed after TUI loads.
 #
 # Features:
-#   - Reads ~/.claude/config/soul-team.toml for agent config
+#   - Config: $SOUL_TEAM_CONFIG > ~/.soul-team/config.toml > ~/.claude/config/soul-team.toml > ./config/soul-team.toml.example
 #   - Dynamic tmux layout based on selected agent count
 #   - Conditional titan-pc SSH (skipped when only local agents)
 #   - Scoped panes.json + sidecars (only selected agents)
@@ -30,9 +40,9 @@
 
 set -euo pipefail
 
-# ── Subcommand: init → delegate to soul-init wizard ──────────────────────────
-if [[ "${1:-}" == "init" ]]; then
-    shift
+# ── Subcommands: delegate management commands to soul-init ────────────────────
+_MGMT_CMDS="init add-agent remove-agent add-machine list-agents list-machines config"
+if [[ " $_MGMT_CMDS " == *" ${1:-} "* ]]; then
     REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
     exec python3 "${REPO_ROOT}/bin/soul-init" "$@"
 fi
@@ -44,7 +54,21 @@ DEV_AGENTS="shuri happy"  # Agents that load CLAUDE-dev.md (code conventions)
 BOOT="Run your daily routine then enter proactive mode when idle."
 DELAY=10
 CLAWTEAM="$HOME/.local/bin/clawteam"
-TOML="$HOME/.claude/config/soul-team.toml"
+# ── Config resolution: env var > ~/.soul-team/ > ~/.claude/config/ > repo example
+_resolve_toml() {
+    if [ -n "${SOUL_TEAM_CONFIG:-}" ] && [ -f "$SOUL_TEAM_CONFIG" ]; then
+        echo "$SOUL_TEAM_CONFIG"
+    elif [ -f "$HOME/.soul-team/config.toml" ]; then
+        echo "$HOME/.soul-team/config.toml"
+    elif [ -f "$HOME/.claude/config/soul-team.toml" ]; then
+        echo "$HOME/.claude/config/soul-team.toml"
+    elif [ -f "${REPO_ROOT:-./}/config/soul-team.toml.example" ]; then
+        echo "${REPO_ROOT:-./}/config/soul-team.toml.example"
+    else
+        echo ""
+    fi
+}
+TOML="$(_resolve_toml)"
 PANES_JSON="$HOME/.clawteam/teams/soul-team/panes.json"
 
 # ── Repo root (resolve via symlink from ~/.local/bin/ back to repo) ────────

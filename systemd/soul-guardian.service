@@ -19,6 +19,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=%h/soul-team
 ReadWritePaths=%h/.claude/config
+ReadWritePaths=%h/.soul-team
 ReadWritePaths=%h/.soul
 ReadWritePaths=%h/.clawteam
 
