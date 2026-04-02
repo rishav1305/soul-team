@@ -69,7 +69,30 @@ else
     fail "setup.sh not found or not executable in $INSTALL_DIR"
 fi
 
-# ── 4. Done ─────────────────────────────────────────────────
+# ── 4. Offer interactive setup ──────────────────────────────
+echo ""
+CONFIG_FILE="$HOME/.claude/config/soul-team.toml"
+
+if [[ ! -f "$CONFIG_FILE" ]] || [[ ! -s "$CONFIG_FILE" ]]; then
+    echo -e "  ${BOLD}No team configuration found.${NC}"
+    echo ""
+    echo "  Would you like to run the interactive setup wizard?"
+    echo -e "  This will configure your agents, deployment mode, and team rules."
+    echo ""
+    read -rp "  Run soul-team init? [Y/n]: " INIT_ANSWER
+    INIT_ANSWER="${INIT_ANSWER:-y}"
+    if [[ "${INIT_ANSWER,,}" == "y" || "${INIT_ANSWER,,}" == "yes" ]]; then
+        echo ""
+        python3 "$INSTALL_DIR/bin/soul-init"
+    else
+        echo ""
+        echo "  Skipped. You can run it later:"
+        echo -e "  ${BOLD}soul-team init${NC}        # Interactive wizard"
+        echo -e "  ${BOLD}soul-team init --quick${NC} # Quick start (3 agents, no prompts)"
+    fi
+fi
+
+# ── 5. Done ─────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}=========================================="
 echo -e "  soul-team is ready!"
@@ -77,8 +100,8 @@ echo -e "==========================================${NC}"
 echo ""
 echo "  Quick start:"
 echo ""
-echo -e "  ${BOLD}cd $INSTALL_DIR${NC}"
-echo -e "  ${BOLD}soul-team${NC}"
+echo -e "  ${BOLD}soul-team init${NC}          # Configure your team (if not done yet)"
+echo -e "  ${BOLD}soul-team${NC}               # Launch your agent team"
 echo ""
 echo "  To update later:"
 echo -e "  ${BOLD}cd $INSTALL_DIR && git pull && ./setup.sh${NC}"

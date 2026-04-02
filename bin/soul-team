@@ -2,8 +2,11 @@
 # soul-team — Launch the Marvel agent team (v2)
 #
 # Usage:
-#   soul-team                           # Launch all 9 agents (default)
-#   soul-team --agents happy,shuri     # Launch only Friday and Shuri
+#   soul-team init                      # Interactive setup wizard
+#   soul-team init --quick              # Quick start (3 agents, no prompts)
+#   soul-team init --quick -n 5         # Quick start with 5 agents
+#   soul-team                           # Launch all agents (default)
+#   soul-team --agents happy,shuri     # Launch only specific agents
 #   soul-team --agents happy           # Launch only Happy
 #   soul-team --all                     # Explicit all (same as no flags)
 #   soul-team --continue                # Reattach + heal + revive dead agents
@@ -26,6 +29,13 @@
 #   - Global daemons always start (router, bridge, heartbeat, guardian)
 
 set -euo pipefail
+
+# ── Subcommand: init → delegate to soul-init wizard ──────────────────────────
+if [[ "${1:-}" == "init" ]]; then
+    shift
+    REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+    exec python3 "${REPO_ROOT}/bin/soul-init" "$@"
+fi
 
 SESSION="soul-team"
 PC="rishav@192.168.0.196"

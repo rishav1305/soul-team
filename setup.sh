@@ -186,16 +186,19 @@ info "Installing configuration..."
 
 CONFIG_DEST="${HOME}/.claude/config/soul-team.toml"
 CONFIG_EXAMPLE="${SCRIPT_DIR}/config/soul-team.toml.example"
+NEEDS_INIT=false
 
 if [[ -f "$CONFIG_DEST" ]]; then
     ok "soul-team.toml already exists -- skipping (will not overwrite)"
 else
+    NEEDS_INIT=true
     if [[ -f "$CONFIG_EXAMPLE" ]]; then
         cp "$CONFIG_EXAMPLE" "$CONFIG_DEST"
         ok "soul-team.toml installed -> $CONFIG_DEST"
-        warn "Edit $CONFIG_DEST to set your SSH targets and agent config."
+        warn "This is a template config. Run 'soul-team init' to customize."
     else
         warn "config/soul-team.toml.example not found -- skipping"
+        warn "Run 'soul-team init' to generate your config interactively."
     fi
 fi
 
@@ -209,19 +212,25 @@ echo -e "${GREEN}==========================================${NC}"
 echo ""
 echo "  Next steps:"
 echo ""
-echo -e "  1. Edit your agent config:"
-echo -e "     ${BOLD}${CONFIG_DEST}${NC}"
+if $NEEDS_INIT; then
+    echo -e "  1. ${BOLD}Configure your team:${NC}"
+    echo -e "     ${BOLD}soul-team init${NC}          # Interactive setup wizard"
+    echo -e "     ${BOLD}soul-team init --quick${NC}   # Quick start (3 agents, no prompts)"
+    echo ""
+    echo -e "  2. Start your agent team:"
+    echo -e "     ${BOLD}soul-team${NC}"
+else
+    echo -e "  1. Start your agent team:"
+    echo -e "     ${BOLD}soul-team${NC}"
+fi
 echo ""
-echo -e "  2. Start your agent team:"
-echo -e "     ${BOLD}soul-team${NC}"
-echo ""
-echo -e "  3. Send a message to an agent:"
+echo -e "  Send a message to an agent:"
 echo -e "     ${BOLD}soul-msg send <agent-name> \"Hello from the terminal\"${NC}"
 echo ""
-echo -e "  4. Check team health:"
+echo -e "  Check team health:"
 echo -e "     ${BOLD}soul-health${NC}"
 echo ""
-echo -e "  5. Optional -- run daemons with systemd:"
+echo -e "  Optional -- run daemons with systemd:"
 echo -e "     ${BOLD}systemctl --user enable --now soul-courier soul-guardian soul-router${NC}"
 echo ""
 echo -e "  Docs: https://github.com/rishav1305/soul-team"
