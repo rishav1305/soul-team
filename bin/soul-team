@@ -291,7 +291,10 @@ def _select_menu_fallback(title: str, options: list[str], descriptions: list[str
         print(f"    {marker} {i + 1}. {opt}{desc}")
 
     while True:
-        raw = input(f"    Choice [{default + 1}]: ").strip()
+        try:
+            raw = input(f"    Choice [{default + 1}]: ").strip()
+        except EOFError:
+            return default
         if not raw:
             return -1 if (back_option and default == len(options) - 1) else default
         try:
@@ -356,7 +359,10 @@ def text_input(prompt: str, default: str = "", allow_empty: bool = False) -> str
     if not _supports_raw_mode():
         # Fallback to basic input()
         while True:
-            answer = input(prefix).strip()
+            try:
+                answer = input(prefix).strip()
+            except EOFError:
+                return default if default else ""
             if not answer and default:
                 return default
             if answer or allow_empty:
@@ -1745,7 +1751,12 @@ def _configure_rules(data: dict) -> None:
     team = data.setdefault("team", {})
 
     section_header("Team Rules")
-    team["name"] = text_input("Team name", default=team.get("name", "my-team"))
+    while True:
+        name = text_input("Team name", default=team.get("name", "my-team"))
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9_-]*$', name):
+            team["name"] = name
+            break
+        warn("Team name must start with a letter and contain only letters, numbers, hyphens, underscores.")
     team["boot_prompt"] = text_input("Boot prompt", default=team.get("boot_prompt", "Run your daily routine."))
     team["stagger_seconds"] = number_input("Stagger delay (seconds)", default=team.get("stagger_seconds", 10), min_val=0, max_val=120)
 
@@ -2456,7 +2467,7 @@ def _dry_run(data: dict, selected_agents: list[str] | None = None) -> None:
         for s in selected_agents:
             if s not in all_names:
                 fail(f"Unknown agent '{s}'. Valid: {', '.join(sorted(all_names))}")
-                return
+                sys.exit(1)
         display_agents = [a for a in agents if a.get("name") in selected_agents]
     else:
         display_agents = agents
@@ -2959,6 +2970,13 @@ def main() -> None:
             fail("No config found. Run 'soul-team' to set up first.")
             sys.exit(1)
         _continue_session(data)
+        return
+
+    if getattr(args, 'all', False):
+        if data is None:
+            fail("No config found. Run 'soul-team' to set up first.")
+            sys.exit(1)
+        _launch_team(data)
         return
 
     if args.dry_run:
