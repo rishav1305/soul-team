@@ -291,7 +291,10 @@ def _select_menu_fallback(title: str, options: list[str], descriptions: list[str
         print(f"    {marker} {i + 1}. {opt}{desc}")
 
     while True:
-        raw = input(f"    Choice [{default + 1}]: ").strip()
+        try:
+            raw = input(f"    Choice [{default + 1}]: ").strip()
+        except EOFError:
+            return default
         if not raw:
             return -1 if (back_option and default == len(options) - 1) else default
         try:
@@ -356,7 +359,10 @@ def text_input(prompt: str, default: str = "", allow_empty: bool = False) -> str
     if not _supports_raw_mode():
         # Fallback to basic input()
         while True:
-            answer = input(prefix).strip()
+            try:
+                answer = input(prefix).strip()
+            except EOFError:
+                return default if default else ""
             if not answer and default:
                 return default
             if answer or allow_empty:
@@ -1415,6 +1421,14 @@ def _custom_wizard() -> TeamConfig:
             if not confirm("Add another machine?", default=False):
                 break
 
+        # Offer to run setup-remote for each machine
+        if config.machines:
+            print()
+            info("Remote machines added. You can provision them now.")
+            for m in config.machines:
+                if confirm(f"Run setup-remote for '{m.name}' ({m.ssh_target})?", default=True):
+                    _run_setup_remote(m.ssh_target)
+
     # Step 4: Team rules
     section_header("Team Rules")
     config.team_name = text_input("Team name", default="my-team")
@@ -1657,6 +1671,86 @@ def _configure_agents(data: dict) -> None:
             ok(f"Set {agents[aidx]['name']} machine to {machine_names[midx]}")
 
 
+def _run_setup_remote(ssh_target: str) -> bool:
+    """Run the setup-remote.sh script for a given SSH target.
+
+    Clones (or updates) the soul-team repo on the remote machine, runs setup.sh,
+    configures SSHFS mounts for shared communication, copies config, and verifies.
+
+    Returns True if setup succeeded, False otherwise.
+    """
+    setup_script = REPO_ROOT / "ops" / "setup-remote.sh"
+    if not setup_script.exists():
+        fail(f"Setup script not found: {setup_script}")
+        return False
+
+    config_path = _resolve_config_path()
+
+    # Detect repo URL from git remote (prefer gitea, fall back to origin)
+    repo_url = "ssh://git@git.titan.local:222/admin/soul-team.git"
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "remote", "get-url", "gitea"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            repo_url = result.stdout.strip()
+        else:
+            result = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "remote", "get-url", "origin"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                repo_url = result.stdout.strip()
+    except Exception:
+        pass
+
+    # Detect primary host IP
+    primary_ip = ""
+    try:
+        result = subprocess.run(
+            ["hostname", "-I"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            primary_ip = result.stdout.strip().split()[0]
+    except Exception:
+        primary_ip = "192.168.0.128"
+
+    primary_user = os.environ.get("USER", "rishav")
+
+    print()
+    info(f"Setting up remote: {ssh_target}")
+    info(f"Repo: {repo_url}")
+    info(f"Primary: {primary_user}@{primary_ip}")
+    print()
+
+    try:
+        result = subprocess.run(
+            [
+                "bash", str(setup_script),
+                ssh_target,
+                repo_url,
+                primary_ip,
+                primary_user,
+                str(config_path),
+            ],
+            timeout=300,
+        )
+        if result.returncode == 0:
+            ok(f"Remote setup for {ssh_target} completed successfully.")
+            return True
+        else:
+            warn(f"Remote setup exited with code {result.returncode}")
+            return False
+    except subprocess.TimeoutExpired:
+        fail("Remote setup timed out (5 min limit)")
+        return False
+    except Exception as e:
+        fail(f"Remote setup failed: {e}")
+        return False
+
+
 def _configure_machines(data: dict) -> None:
     """Machine management sub-menu."""
     config_path = _resolve_config_path()
@@ -1688,7 +1782,8 @@ def _configure_machines(data: dict) -> None:
 
         choice = select_menu(
             "What to do?",
-            ["Add machine", "Remove machine", "Test SSH connectivity"],
+            ["Add machine", "Remove machine", "Test SSH connectivity",
+             "Setup remote (clone repo + sync)"],
             back_option=True,
         )
 
@@ -1706,6 +1801,10 @@ def _configure_machines(data: dict) -> None:
             machines.append({"name": name, "ssh": ssh_target})
             _save_toml_from_dict(data, config_path)
             ok(f"Added machine '{name}'")
+
+            # Offer to run setup-remote immediately
+            if confirm("Run setup-remote now? (clone repo, sync comms, install mounts)", default=True):
+                _run_setup_remote(ssh_target)
 
         elif choice == 1:
             if not known_machines:
@@ -1738,6 +1837,19 @@ def _configure_machines(data: dict) -> None:
                 else:
                     print(f"{RED}FAIL{NC}")
 
+        elif choice == 3:
+            # Setup remote — clone repo, set up sshfs mounts, sync config
+            if not known_machines:
+                warn("No remote machines configured. Add one first.")
+                continue
+            machine_names_list = list(known_machines.keys())
+            ridx = select_menu("Setup which machine?", machine_names_list, back_option=True)
+            if ridx == -1:
+                continue
+            target_name = machine_names_list[ridx]
+            ssh_target = known_machines[target_name]
+            _run_setup_remote(ssh_target)
+
 
 def _configure_rules(data: dict) -> None:
     """Edit team rules."""
@@ -1745,7 +1857,14 @@ def _configure_rules(data: dict) -> None:
     team = data.setdefault("team", {})
 
     section_header("Team Rules")
-    team["name"] = text_input("Team name", default=team.get("name", "my-team"))
+    while True:
+        name = text_input("Team name", default=team.get("name", "my-team"))
+        # Sanitize: tmux session names can't have dots, colons, or spaces
+        import re as _re
+        if _re.match(r'^[a-zA-Z][a-zA-Z0-9_-]*$', name):
+            team["name"] = name
+            break
+        warn("Team name must start with a letter and contain only letters, numbers, hyphens, underscores.")
     team["boot_prompt"] = text_input("Boot prompt", default=team.get("boot_prompt", "Run your daily routine."))
     team["stagger_seconds"] = number_input("Stagger delay (seconds)", default=team.get("stagger_seconds", 10), min_val=0, max_val=120)
 
@@ -2456,7 +2575,7 @@ def _dry_run(data: dict, selected_agents: list[str] | None = None) -> None:
         for s in selected_agents:
             if s not in all_names:
                 fail(f"Unknown agent '{s}'. Valid: {', '.join(sorted(all_names))}")
-                return
+                sys.exit(1)
         display_agents = [a for a in agents if a.get("name") in selected_agents]
     else:
         display_agents = agents
@@ -2694,6 +2813,44 @@ def cmd_add_machine(args) -> None:
     ok(f"Added machine '{args.name}' (ssh={args.ssh})")
 
 
+def cmd_setup_remote(args) -> None:
+    """Set up a remote machine: clone repo, install, configure SSHFS mounts, sync config."""
+    config_path = _resolve_config_path()
+
+    # Resolve machine name to SSH target
+    ssh_target = args.machine
+    if config_path.exists() and "@" not in args.machine:
+        # Looks like a machine name, not a direct SSH target — resolve from config
+        data = _load_toml(config_path)
+        machines = data.get("machines", [])
+        found = False
+        for m in machines:
+            if m.get("name") == args.machine:
+                ssh_target = m.get("ssh", "")
+                found = True
+                break
+        # Also check agent-level SSH targets
+        if not found:
+            for a in data.get("agents", []):
+                if a.get("machine") == args.machine and a.get("ssh"):
+                    ssh_target = a["ssh"]
+                    found = True
+                    break
+        if not found and "@" not in ssh_target:
+            fail(f"Machine '{args.machine}' not found in config. Use user@host directly or add the machine first.")
+            sys.exit(1)
+
+    if not ssh_target:
+        fail("Could not determine SSH target.")
+        sys.exit(1)
+
+    info(f"Setting up remote: {ssh_target}")
+
+    success = _run_setup_remote(ssh_target)
+    if not success:
+        sys.exit(1)
+
+
 def cmd_list_agents(args) -> None:
     """List current agent roster."""
     config_path = _resolve_config_path()
@@ -2880,6 +3037,12 @@ def main() -> None:
     add_machine_p.add_argument("ssh")
     add_machine_p.add_argument("--no-test", action="store_true")
 
+    # setup-remote
+    setup_remote_p = subparsers.add_parser("setup-remote", help="Setup remote machine (clone repo + sync)")
+    setup_remote_p.add_argument("machine", help="Machine name (from config) or direct SSH target (user@host)")
+    setup_remote_p.add_argument("--repo-url", default=None, help="Git repo URL to clone")
+    setup_remote_p.add_argument("--primary-ip", default=None, help="IP of primary machine")
+
     # list-agents, list-machines, config
     subparsers.add_parser("list-agents")
     subparsers.add_parser("list-machines")
@@ -2922,6 +3085,9 @@ def main() -> None:
     if args.command == "add-machine":
         cmd_add_machine(args)
         return
+    if args.command == "setup-remote":
+        cmd_setup_remote(args)
+        return
     if args.command == "list-agents":
         cmd_list_agents(args)
         return
@@ -2959,6 +3125,13 @@ def main() -> None:
             fail("No config found. Run 'soul-team' to set up first.")
             sys.exit(1)
         _continue_session(data)
+        return
+
+    if getattr(args, 'all', False):
+        if data is None:
+            fail("No config found. Run 'soul-team' to set up first.")
+            sys.exit(1)
+        _launch_team(data)
         return
 
     if args.dry_run:
