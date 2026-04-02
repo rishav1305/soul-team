@@ -37,19 +37,29 @@ from typing import Optional
 # ANSI ESCAPE CODES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-BOLD = "\033[1m"
-DIM = "\033[2m"
-ITALIC = "\033[3m"
-UNDERLINE = "\033[4m"
-GREEN = "\033[0;32m"
-YELLOW = "\033[1;33m"
-RED = "\033[0;31m"
-CYAN = "\033[0;36m"
-MAGENTA = "\033[0;35m"
-BLUE = "\033[0;34m"
-WHITE = "\033[1;37m"
-GRAY = "\033[0;90m"
-NC = "\033[0m"  # No Color / Reset
+# Detect NO_COLOR (https://no-color.org/) — can be overridden by --no-color flag
+_NO_COLOR = bool(os.environ.get("NO_COLOR")) or not sys.stdout.isatty()
+
+def _c(code: str) -> str:
+    """Return ANSI code if color is enabled, empty string otherwise."""
+    return "" if _NO_COLOR else code
+
+BOLD = _c("\033[1m")
+DIM = _c("\033[2m")
+ITALIC = _c("\033[3m")
+UNDERLINE = _c("\033[4m")
+GREEN = _c("\033[0;32m")
+BRIGHT_GREEN = _c("\033[1;32m")
+YELLOW = _c("\033[1;33m")
+RED = _c("\033[0;31m")
+CYAN = _c("\033[0;36m")
+BRIGHT_CYAN = _c("\033[1;36m")
+MAGENTA = _c("\033[0;35m")
+BLUE = _c("\033[0;34m")
+BRIGHT_BLUE = _c("\033[1;34m")
+WHITE = _c("\033[1;37m")
+GRAY = _c("\033[0;90m")
+NC = _c("\033[0m")  # No Color / Reset
 
 # Box-drawing characters
 BOX_TL = "\u256d"  # top-left
@@ -58,14 +68,35 @@ BOX_BL = "\u2570"  # bottom-left
 BOX_BR = "\u256f"  # bottom-right
 BOX_H = "\u2500"   # horizontal
 BOX_V = "\u2502"   # vertical
+BOX_T = "\u252c"   # T-junction top
+BOX_CROSS = "\u253c"  # cross junction
+BOX_L = "\u251c"   # left T
+BOX_R = "\u2524"   # right T
+BOX_BT = "\u2534"  # bottom T
 BULLET = "\u2022"  # bullet
 CHECK = "\u2713"   # checkmark
 CROSS = "\u2717"   # cross
 ARROW = "\u276f"   # arrow
 DOT = "\u25cf"     # filled circle
 CIRCLE = "\u25cb"  # empty circle
+DIAMOND = "\u25c7"  # diamond (like Claude Code)
+DIAMOND_FILL = "\u25c6"  # filled diamond
+MIDDOT = "\u00b7"  # middle dot separator
 
 VERSION = "2.0.0"
+_TEMPLATE_COUNT = 16
+_LICENSE = "MIT"
+
+
+def _disable_colors() -> None:
+    """Disable all ANSI color codes globally (called when --no-color is used)."""
+    global _NO_COLOR, BOLD, DIM, ITALIC, UNDERLINE, GREEN, BRIGHT_GREEN, YELLOW, RED
+    global CYAN, BRIGHT_CYAN, MAGENTA, BLUE, BRIGHT_BLUE, WHITE, GRAY, NC
+    _NO_COLOR = True
+    BOLD = DIM = ITALIC = UNDERLINE = ""
+    GREEN = BRIGHT_GREEN = YELLOW = RED = ""
+    CYAN = BRIGHT_CYAN = MAGENTA = BLUE = BRIGHT_BLUE = ""
+    WHITE = GRAY = NC = ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PATHS
@@ -177,23 +208,35 @@ def select_menu(title: str, options: list[str], descriptions: list[str] | None =
     cursor = default
     num_opts = len(display_options)
 
+    # Build navigation hint string
+    nav_parts = [f"\u2191/\u2193 Navigate", "Enter Select"]
+    if back_option:
+        nav_parts.append("Esc Back")
+    nav_parts.append("Ctrl+C Quit")
+    nav_str = f"  {GRAY}{f'  {MIDDOT}  '.join(nav_parts)}{NC}"
+
     _hide_cursor()
     try:
         while True:
             # Render
             lines = []
-            lines.append(f"  {BOLD}?{NC} {title}")
+            lines.append(f"  {BRIGHT_BLUE}?{NC} {BOLD}{title}{NC}")
             for i, opt in enumerate(display_options):
                 if i == cursor:
-                    prefix = f"  {CYAN}{ARROW}{NC} "
-                    line = f"{prefix}{BOLD}{opt}{NC}"
+                    prefix = f"  {CYAN}\u276f{NC} "
+                    line = f"{prefix}{BOLD}{WHITE}{opt}{NC}"
                 else:
                     line = f"    {DIM}{opt}{NC}"
 
-                if display_descs and display_descs[i]:
-                    line += f"  {GRAY}{display_descs[i]}{NC}"
+                if display_descs and i < len(display_descs or []) and display_descs[i]:
+                    sep = f" {GRAY}{MIDDOT}{NC} " if i == cursor else "  "
+                    line += f"{sep}{GRAY}{display_descs[i]}{NC}"
 
                 lines.append(line)
+
+            # Navigation hints at bottom
+            lines.append("")
+            lines.append(nav_str)
 
             output = "\n".join(lines)
             sys.stdout.write(output + "\n")
@@ -260,7 +303,7 @@ def confirm(prompt: str, default: bool = True) -> bool:
     """Y/n confirmation prompt."""
     if _supports_raw_mode():
         hint = f"{'Y' if default else 'y'}/{'n' if default else 'N'}"
-        sys.stdout.write(f"  {BOLD}?{NC} {prompt} [{hint}] ")
+        sys.stdout.write(f"  {BRIGHT_BLUE}?{NC} {prompt} {DIM}[{hint}]{NC} ")
         sys.stdout.flush()
 
         _hide_cursor()
@@ -291,7 +334,7 @@ def confirm(prompt: str, default: bool = True) -> bool:
 
     # Fallback
     hint = "Y/n" if default else "y/N"
-    raw = input(f"  {BOLD}?{NC} {prompt} [{hint}]: ").strip().lower()
+    raw = input(f"  {BRIGHT_BLUE}?{NC} {prompt} {DIM}[{hint}]{NC}: ").strip().lower()
     if not raw:
         return default
     return raw in ("y", "yes")
@@ -300,9 +343,9 @@ def confirm(prompt: str, default: bool = True) -> bool:
 def text_input(prompt: str, default: str = "", allow_empty: bool = False) -> str:
     """Text input with default value."""
     if default:
-        display = f"  {BOLD}?{NC} {prompt} {DIM}({default}){NC}: "
+        display = f"  {BRIGHT_BLUE}?{NC} {prompt} {DIM}({default}){NC}: "
     else:
-        display = f"  {BOLD}?{NC} {prompt}: "
+        display = f"  {BRIGHT_BLUE}?{NC} {prompt}: "
 
     while True:
         answer = input(display).strip()
@@ -341,7 +384,7 @@ def multi_select(title: str, options: list[str], descriptions: list[str] | None 
     try:
         while True:
             lines = []
-            lines.append(f"  {BOLD}?{NC} {title} {DIM}(space to toggle, enter to confirm){NC}")
+            lines.append(f"  {BRIGHT_BLUE}?{NC} {BOLD}{title}{NC} {DIM}(Space toggle  {MIDDOT}  Enter confirm){NC}")
             for i, opt in enumerate(options):
                 check = f"{GREEN}{CHECK}{NC}" if i in selected else f"{DIM}{CIRCLE}{NC}"
                 if i == cursor:
@@ -406,21 +449,95 @@ def _multi_select_fallback(title: str, options: list[str], descriptions: list[st
 # UI PRIMITIVES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def banner() -> None:
-    """Print the soul-team welcome banner."""
-    width = 45
+def _get_terminal_width() -> int:
+    """Get terminal width, default 80."""
+    try:
+        return os.get_terminal_size().columns
+    except (OSError, ValueError):
+        return 80
+
+
+def banner(state: str = "first_run", data: dict | None = None) -> None:
+    """Print the soul-team banner matching Claude Code's style.
+
+    Adapts output based on state: first_run, configured, running.
+    """
     print()
-    print(f"  {CYAN}{BOX_TL}{BOX_H * width}{BOX_TR}{NC}")
-    print(f"  {CYAN}{BOX_V}{NC}{' ' * ((width - 20) // 2)}{BOLD}{WHITE}soul-team v{VERSION}{NC}{' ' * ((width - 19) // 2)}{CYAN}{BOX_V}{NC}")
-    print(f"  {CYAN}{BOX_V}{NC}{' ' * ((width - 36) // 2)}{DIM}Multi-Agent Runtime for Claude Code{NC}{' ' * ((width - 35) // 2)}{CYAN}{BOX_V}{NC}")
-    print(f"  {CYAN}{BOX_BL}{BOX_H * width}{BOX_BR}{NC}")
+    # Primary banner line — clean, minimal, Claude-inspired
+    print(f"  {BRIGHT_CYAN}{DIAMOND_FILL}{NC} {BOLD}{WHITE}soul-team{NC} {DIM}v{VERSION}{NC}")
+    print(f"  {DIM}Multi-Agent Runtime for Claude Code{NC}")
     print()
+
+    if state == "first_run":
+        # Show template count and license
+        print(f"  {DIM}{_TEMPLATE_COUNT} agent templates  {MIDDOT}  {_LICENSE} License{NC}")
+        print()
+        return
+
+    if data is None:
+        return
+
+    team = data.get("team", {})
+    agents = data.get("agents", [])
+    team_name = team.get("name", "unnamed")
+
+    if state == "configured":
+        # Count local vs remote
+        local = sum(1 for a in agents if a.get("machine", "local") == "local")
+        remote = len(agents) - local
+        loc_str = f"{local} local"
+        if remote > 0:
+            loc_str += f", {remote} remote"
+
+        # Model distribution
+        models: dict[str, int] = {}
+        for a in agents:
+            m = a.get("model", "sonnet")
+            models[m] = models.get(m, 0) + 1
+        model_str = ", ".join(f"{v} {k}" for k, v in sorted(models.items(), key=lambda x: -x[1]))
+
+        print(f"  {BOLD}Team:{NC} {team_name}  {MIDDOT}  {len(agents)} agents  {MIDDOT}  {loc_str}")
+        if model_str:
+            print(f"  {DIM}Models: {model_str}{NC}")
+        print()
+
+    elif state == "running":
+        alive, total = _count_running_agents(team_name)
+        uptime = _get_session_uptime(team_name)
+
+        # Check services
+        services = _check_services()
+        svc_str = "  ".join(status_dot(name, is_ok) for name, is_ok in services.items())
+
+        agent_color = GREEN if alive == total else (YELLOW if alive > 0 else RED)
+        print(f"  {BOLD}Team:{NC} {team_name}  {MIDDOT}  {agent_color}{alive}/{total} agents running{NC}")
+        print(f"  {DIM}Session active since {uptime}{NC}  {MIDDOT}  {svc_str}")
+        print()
+
+
+def _check_services() -> dict[str, bool]:
+    """Check systemd service status for guardian, courier, router."""
+    services = {}
+    for svc in ["soul-guardian", "soul-courier", "soul-router"]:
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", f"{svc}.service"],
+                capture_output=True, text=True,
+            )
+            services[svc.replace("soul-", "").capitalize()] = result.stdout.strip() == "active"
+        except Exception:
+            services[svc.replace("soul-", "").capitalize()] = False
+    return services
 
 
 def section_header(title: str) -> None:
-    """Print a section header."""
+    """Print a section header with subtle line."""
     print()
-    print(f"  {CYAN}{BOX_H * 3} {title} {BOX_H * max(1, 45 - len(title))}{NC}")
+    tw = _get_terminal_width()
+    line_len = min(tw - 4, 60)
+    title_len = len(title) + 2  # space on each side
+    right = max(1, line_len - title_len - 3)
+    print(f"  {GRAY}{BOX_H * 3} {NC}{DIM}{title}{NC} {GRAY}{BOX_H * right}{NC}")
     print()
 
 
@@ -437,13 +554,29 @@ def fail(msg: str) -> None:
 
 
 def info(msg: str) -> None:
-    print(f"  {BOLD}{msg}{NC}")
+    print(f"  {BRIGHT_BLUE}{DIAMOND}{NC} {msg}")
 
 
 def status_dot(label: str, ok: bool) -> str:
     """Return a colored status dot with label."""
     dot = f"{GREEN}{DOT}{NC}" if ok else f"{RED}{DOT}{NC}"
-    return f"{label} {dot}"
+    return f"{label}: {dot}"
+
+
+def hint(text: str) -> None:
+    """Print a dim hint/tip line."""
+    print(f"  {GRAY}{text}{NC}")
+
+
+def nav_hints() -> None:
+    """Print navigation hints bar at the bottom."""
+    parts = [
+        f"{DIM}\u2191/\u2193 Navigate{NC}",
+        f"{DIM}Enter Select{NC}",
+        f"{DIM}q Quit{NC}",
+    ]
+    print(f"  {f'  {MIDDOT}  '.join(parts)}")
+    print()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1030,7 +1163,7 @@ def write_config(config: TeamConfig) -> list[str]:
 
 def flow_first_run(quick: bool = False, num_agents: int = 3) -> bool:
     """First-run setup wizard. Returns True if user wants to launch after setup."""
-    print(f"  {DIM}Welcome! Let's set up your agent team.{NC}")
+    print(f"  Welcome! Let's set up your first agent team.")
     print()
 
     if quick:
@@ -1043,10 +1176,16 @@ def flow_first_run(quick: bool = False, num_agents: int = 3) -> bool:
 
     # Ask: Quick or Custom?
     choice = select_menu(
-        "How would you like to set up?",
+        "Quick setup or custom?",
         [
-            "Quick  (3 agents, ready in 30 seconds)",
-            "Custom (choose agents, machines, rules)",
+            "Quick start",
+            "Custom setup",
+            "Import config",
+        ],
+        descriptions=[
+            "3 agents, ready in 30 seconds",
+            "choose agents, machines, and rules",
+            "load an existing soul-team.toml",
         ],
         default=0,
     )
@@ -1055,6 +1194,20 @@ def flow_first_run(quick: bool = False, num_agents: int = 3) -> bool:
         config = _quick_start_config(3)
         write_config(config)
         _print_roster(config)
+        return confirm("Launch now?")
+
+    if choice == 2:
+        # Import existing config
+        path = text_input("Path to soul-team.toml")
+        p = Path(path).expanduser()
+        if not p.exists():
+            fail(f"File not found: {path}")
+            return False
+        # Copy to config dir
+        USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        dest = USER_CONFIG_DIR / "config.toml"
+        shutil.copy2(p, dest)
+        ok(f"Imported config to {dest}")
         return confirm("Launch now?")
 
     # Full custom wizard
@@ -1185,14 +1338,22 @@ def _custom_wizard() -> TeamConfig:
 
 
 def _print_roster(config: TeamConfig) -> None:
-    """Print agent roster summary."""
+    """Print agent roster summary with box-drawn table."""
     print()
-    info("Agent Roster:")
-    print(f"    {BOLD}{'NAME':<16} {'MODEL':<10} {'MACHINE':<12} {'TEMPLATE'}{NC}")
-    print(f"    {GRAY}{'─' * 15} {'─' * 9} {'─' * 11} {'─' * 12}{NC}")
+    section_header("Agent Roster")
+
+    # Column widths
+    cw = {"name": 16, "model": 10, "machine": 12, "template": 14}
+
+    # Header
+    print(f"  {BOLD}{'NAME':<{cw['name']}} {'MODEL':<{cw['model']}} {'MACHINE':<{cw['machine']}} {'TEMPLATE'}{NC}")
+    total_w = cw["name"] + cw["model"] + cw["machine"] + cw["template"]
+    print(f"  {GRAY}{BOX_H * total_w}{NC}")
+
     for a in config.agents:
         tmpl = a.template or "(custom)"
-        print(f"    {a.name:<16} {a.model:<10} {a.machine:<12} {tmpl}")
+        model_color = CYAN if a.model == "opus" else (GREEN if a.model == "sonnet" else DIM)
+        print(f"  {a.name:<{cw['name']}} {model_color}{a.model:<{cw['model']}}{NC} {a.machine:<{cw['machine']}} {DIM}{tmpl}{NC}")
     print()
 
 
@@ -1202,21 +1363,24 @@ def _print_roster(config: TeamConfig) -> None:
 
 def flow_configured(data: dict) -> None:
     """State 2: Config exists, no session running."""
-    team = data.get("team", {})
-    agents = data.get("agents", [])
-    team_name = team.get("name", "unnamed")
-
-    print(f"  {BOLD}Team:{NC} {team_name} ({len(agents)} agents)")
-    print()
-
     while True:
         choice = select_menu(
             "What would you like to do?",
-            ["Launch team", "Configure", "Validate (dry-run)", "Exit"],
+            [
+                "Launch team",
+                "Configure",
+                "Validate (dry-run)",
+                "Exit",
+            ],
+            descriptions=[
+                "Start all agents in tmux",
+                "Modify agents, machines, policies",
+                "Check config without launching",
+                "",
+            ],
         )
 
         if choice == 0:
-            # Launch
             _launch_team(data)
             return
         elif choice == 1:
@@ -1225,7 +1389,7 @@ def flow_configured(data: dict) -> None:
             _dry_run(data)
         elif choice == 3:
             print()
-            print(f"  {DIM}Goodbye.{NC}")
+            hint("Session not started. Run 'soul-team' to return.")
             return
 
 
@@ -1482,28 +1646,35 @@ def _configure_policies(data: dict) -> None:
 def _view_config(data: dict) -> None:
     """Display current configuration."""
     config_path = _resolve_config_path()
-    print()
-    info(f"Config: {config_path}")
+
+    section_header("Current Configuration")
+    hint(f"File: {config_path}")
     print()
 
     team = data.get("team", {})
     if team:
-        print(f"  {CYAN}[team]{NC}")
+        print(f"  {BRIGHT_CYAN}[team]{NC}")
         for k, v in team.items():
-            print(f"    {k} = {v}")
+            print(f"    {DIM}{k}{NC} = {BOLD}{v}{NC}")
         print()
 
     policies = data.get("policies", {})
     if policies:
-        print(f"  {CYAN}[policies]{NC}")
+        print(f"  {BRIGHT_CYAN}[policies]{NC}")
         for k, v in policies.items():
-            print(f"    {k} = {v}")
+            val_color = GREEN if v is True else (RED if v is False else "")
+            val_nc = NC if val_color else ""
+            print(f"    {DIM}{k}{NC} = {val_color}{v}{val_nc}")
         print()
 
     agents = data.get("agents", [])
-    print(f"  {CYAN}Agents ({len(agents)}):{NC}")
+    print(f"  {BRIGHT_CYAN}Agents ({len(agents)}):{NC}")
     for a in agents:
-        print(f"    {a.get('name', '?')} ({a.get('model', 'sonnet')}, {a.get('machine', 'local')})")
+        name = a.get("name", "?")
+        model = a.get("model", "sonnet")
+        machine = a.get("machine", "local")
+        model_color = CYAN if model == "opus" else (GREEN if model == "sonnet" else DIM)
+        print(f"    {name:<16} {model_color}{model}{NC}  {DIM}{machine}{NC}")
     print()
 
 
@@ -1514,14 +1685,7 @@ def _view_config(data: dict) -> None:
 def flow_running(data: dict) -> None:
     """State 3: Session is active."""
     team = data.get("team", {})
-    agents = data.get("agents", [])
     team_name = team.get("name", "soul-team")
-    uptime = _get_session_uptime(team_name)
-    alive, total = _count_running_agents(team_name)
-
-    print(f"  {BOLD}Team:{NC} {team_name} ({alive}/{total} agents running)")
-    print(f"  {BOLD}Session:{NC} {team_name} [{GREEN}active{NC} since {uptime} ago]")
-    print()
 
     while True:
         choice = select_menu(
@@ -1535,6 +1699,16 @@ def flow_running(data: dict) -> None:
                 "Stop session",
                 "Configure (for next launch)",
                 "Exit",
+            ],
+            descriptions=[
+                "Open the tmux session",
+                "Service status, agent counts, events",
+                "Per-agent model, machine, status",
+                "Route a message via courier",
+                "Revive agents that have exited",
+                "Shut down all agents and services",
+                "Edit config for next launch",
+                "",
             ],
         )
 
@@ -1557,7 +1731,7 @@ def flow_running(data: dict) -> None:
             _configure_menu(data)
         elif choice == 7:
             print()
-            print(f"  {DIM}Session still running. Use 'soul-team' to return.{NC}")
+            hint("Session still running. Run 'soul-team' to return.")
             return
 
 
@@ -1574,13 +1748,7 @@ def _health_dashboard(team_name: str, data: dict) -> None:
         alive, total = _count_running_agents(team_name)
 
         # Check services
-        services = {}
-        for svc in ["soul-guardian", "soul-courier", "soul-router"]:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-active", f"{svc}.service"],
-                capture_output=True, text=True,
-            )
-            services[svc.replace("soul-", "")] = result.stdout.strip() == "active"
+        services = _check_services()
 
         # Memory estimate from heartbeat files
         heartbeat_dir = HOME / ".clawteam" / "heartbeat"
@@ -1590,42 +1758,62 @@ def _health_dashboard(team_name: str, data: dict) -> None:
         event_dir = HOME / ".clawteam" / "teams" / team_name / "queue"
         event_count = len(list(event_dir.glob("*.json"))) if event_dir.exists() else 0
 
+        # Uptime
+        uptime = _get_session_uptime(team_name)
+
         print()
-        print(f"  {BOLD}{BOX_H * 50}{NC}")
+        w = 52
+        print(f"  {GRAY}{BOX_TL}{BOX_H * w}{BOX_TR}{NC}")
+        print(f"  {GRAY}{BOX_V}{NC} {BOLD}Health Dashboard{NC}{' ' * (w - 17)}{GRAY}{BOX_V}{NC}")
+        print(f"  {GRAY}{BOX_V}{NC}{' ' * w}{GRAY}{BOX_V}{NC}")
+
+        # Services row
         svc_str = "  ".join(status_dot(name, is_ok) for name, is_ok in services.items())
-        print(f"  {BOLD}SERVICES{NC}  {svc_str}")
+        svc_label = f" {BOLD}Services{NC}   {svc_str}"
+        # Approximate visible length (strip ANSI for padding)
+        print(f"  {GRAY}{BOX_V}{NC}{svc_label}{' ' * 2}{GRAY}{BOX_V}{NC}")
+
+        # Agents row
         agent_color = GREEN if alive == total else (YELLOW if alive > 0 else RED)
-        print(f"  {BOLD}AGENTS{NC}    {agent_color}{alive} running{NC}, {total - alive} down, {total} total")
-        print(f"  {BOLD}EVENTS{NC}    {event_count} queue files")
-        print(f"  {BOLD}{BOX_H * 50}{NC}")
+        down = total - alive
+        down_str = f", {RED}{down} down{NC}" if down > 0 else ""
+        print(f"  {GRAY}{BOX_V}{NC}  {BOLD}Agents{NC}     {agent_color}{alive} running{NC}{down_str}, {total} total{' ' * 6}{GRAY}{BOX_V}{NC}")
+
+        # Events row
+        print(f"  {GRAY}{BOX_V}{NC}  {BOLD}Events{NC}     {event_count} queued{' ' * (w - 21)}{GRAY}{BOX_V}{NC}")
+
+        # Uptime row
+        print(f"  {GRAY}{BOX_V}{NC}  {BOLD}Uptime{NC}     {uptime}{' ' * max(1, w - 12 - len(uptime))}{GRAY}{BOX_V}{NC}")
+
+        print(f"  {GRAY}{BOX_V}{NC}{' ' * w}{GRAY}{BOX_V}{NC}")
+        print(f"  {GRAY}{BOX_BL}{BOX_H * w}{BOX_BR}{NC}")
         print()
 
         if not _supports_raw_mode():
             input(f"  Press Enter to go back...")
             return
 
-        print(f"  {DIM}Press q to go back, r to refresh{NC}")
+        print(f"  {GRAY}r Refresh  {MIDDOT}  q Back  {MIDDOT}  Ctrl+C Quit{NC}")
         _hide_cursor()
         try:
             key = _read_key()
             if key == "q" or key == "escape":
-                # Clear the dashboard output
-                _clear_lines(9)
+                _clear_lines(12)
                 return
             elif key == "r":
-                _clear_lines(9)
+                _clear_lines(12)
                 continue
             elif key == "ctrl-c":
                 _show_cursor()
                 raise KeyboardInterrupt()
             else:
-                _clear_lines(9)
+                _clear_lines(12)
         finally:
             _show_cursor()
 
 
 def _agent_status_board(team_name: str, data: dict) -> None:
-    """Show per-agent status."""
+    """Show per-agent status with polished table."""
     panes_json = HOME / ".clawteam" / "teams" / team_name / "panes.json"
     if not panes_json.exists():
         warn("No panes.json found. Session may not be tracked.")
@@ -1640,9 +1828,17 @@ def _agent_status_board(team_name: str, data: dict) -> None:
     agents = data.get("agents", [])
     agent_info = {a.get("name", ""): a for a in agents}
 
-    print()
-    print(f"  {BOLD}{'AGENT':<16} {'MODEL':<10} {'MACHINE':<12} {'STATUS'}{NC}")
-    print(f"  {GRAY}{'─' * 15} {'─' * 9} {'─' * 11} {'─' * 10}{NC}")
+    section_header("Agent Status Board")
+
+    # Column widths
+    cw = {"name": 16, "model": 10, "machine": 12, "status": 12}
+
+    print(f"  {BOLD}{'AGENT':<{cw['name']}} {'MODEL':<{cw['model']}} {'MACHINE':<{cw['machine']}} {'STATUS'}{NC}")
+    total_w = sum(cw.values())
+    print(f"  {GRAY}{BOX_H * total_w}{NC}")
+
+    running_count = 0
+    dead_count = 0
 
     for agent_name, pane_id in panes.items():
         if agent_name == "team-lead":
@@ -1659,14 +1855,22 @@ def _agent_status_board(team_name: str, data: dict) -> None:
             )
             content = result.stdout.strip()
             if content and not re.match(r'^[a-z]+@[a-zA-Z0-9-]+[^>]*\$\s*$', content):
-                status = f"{GREEN}running{NC}"
+                status_str = f"{GREEN}{DOT} running{NC}"
+                running_count += 1
             else:
-                status = f"{RED}dead{NC}"
+                status_str = f"{RED}{DOT} down{NC}"
+                dead_count += 1
         except Exception:
-            status = f"{YELLOW}unknown{NC}"
+            status_str = f"{YELLOW}{DOT} unknown{NC}"
 
-        print(f"  {agent_name:<16} {model:<10} {machine:<12} {status}")
+        model_color = CYAN if model == "opus" else (GREEN if model == "sonnet" else DIM)
+        print(f"  {agent_name:<{cw['name']}} {model_color}{model:<{cw['model']}}{NC} {machine:<{cw['machine']}} {status_str}")
 
+    print(f"  {GRAY}{BOX_H * total_w}{NC}")
+    summary_parts = [f"{GREEN}{running_count} running{NC}"]
+    if dead_count > 0:
+        summary_parts.append(f"{RED}{dead_count} down{NC}")
+    print(f"  {', '.join(summary_parts)}")
     print()
 
 
@@ -2453,19 +2657,26 @@ def _quick_status() -> None:
     state, data = detect_state()
 
     if state == "first_run":
-        print("  Status: not configured")
-        print("  Run 'soul-team' to set up.")
+        print(f"  {DIAMOND} soul-team v{VERSION}")
+        print(f"  Status: {DIM}not configured{NC}")
+        hint("Run 'soul-team' to set up.")
         return
 
     team_name = data.get("team", {}).get("name", "soul-team")
     agents = data.get("agents", [])
 
+    print(f"  {BRIGHT_CYAN}{DIAMOND_FILL}{NC} {BOLD}soul-team{NC} {DIM}v{VERSION}{NC}")
+
     if state == "running":
         alive, total = _count_running_agents(team_name)
         uptime = _get_session_uptime(team_name)
-        print(f"  Team: {team_name} | Agents: {alive}/{total} running | Uptime: {uptime}")
+        agent_color = GREEN if alive == total else (YELLOW if alive > 0 else RED)
+        services = _check_services()
+        svc_str = "  ".join(status_dot(name, is_ok) for name, is_ok in services.items())
+        print(f"  Team: {team_name}  {MIDDOT}  {agent_color}{alive}/{total} running{NC}  {MIDDOT}  Uptime: {uptime}")
+        print(f"  {svc_str}")
     else:
-        print(f"  Team: {team_name} | Agents: {len(agents)} configured | Session: stopped")
+        print(f"  Team: {team_name}  {MIDDOT}  {len(agents)} agents configured  {MIDDOT}  {DIM}Session: stopped{NC}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2489,6 +2700,10 @@ def main() -> None:
             The CLI detects state automatically and shows the right interface.
         """),
     )
+
+    # Display flags
+    parser.add_argument("--version", "-V", action="store_true", help="Show version and exit")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
 
     # Power-user flags (backward compat)
     parser.add_argument("--dry-run", action="store_true", help="Validate config without launching")
@@ -2530,9 +2745,21 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # ── Handle --no-color early (before any output) ──
+    if args.no_color:
+        _disable_colors()
+
+    # ── Handle --version ──
+    if args.version:
+        print(f"soul-team v{VERSION}")
+        print(f"Multi-Agent Runtime for Claude Code")
+        print(f"{_TEMPLATE_COUNT} templates  {MIDDOT}  {_LICENSE} License")
+        print(f"Python {sys.version.split()[0]}  {MIDDOT}  {sys.platform}")
+        return
+
     # ── Dispatch subcommands (backward compat) ──
     if args.command == "init":
-        banner()
+        banner("first_run")
         quick = getattr(args, "init_quick", False)
         num = getattr(args, "init_num", 3)
         should_launch = flow_first_run(quick=quick, num_agents=num)
@@ -2576,7 +2803,7 @@ def main() -> None:
         selected_agents = [a.strip() for a in args.agents.split(",")]
 
     if args.quick:
-        banner()
+        banner("first_run")
         should_launch = flow_first_run(quick=True, num_agents=args.num_agents)
         if should_launch:
             state, data = detect_state()
@@ -2606,7 +2833,7 @@ def main() -> None:
         return
 
     # ── Interactive mode: state-driven routing ──
-    banner()
+    banner(state, data)
 
     if state == "first_run":
         should_launch = flow_first_run()
