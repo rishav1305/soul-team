@@ -188,6 +188,12 @@ def _show_cursor() -> None:
     sys.stdout.flush()
 
 
+def clear_screen() -> None:
+    """Clear terminal screen and move cursor to top-left."""
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
 def select_menu(title: str, options: list[str], descriptions: list[str] | None = None,
                 default: int = 0, back_option: bool = False) -> int:
     """Arrow-key navigable menu. Returns selected index, or -1 for back.
@@ -1482,8 +1488,15 @@ def flow_configured(data: dict) -> None:
             return
         elif choice == 1:
             _configure_menu(data)
+            # Clear screen when returning from configure to main menu
+            clear_screen()
+            banner("configured", data)
         elif choice == 2:
             _dry_run(data)
+            # Clear screen when returning from dry-run to main menu
+            time.sleep(0.5)
+            clear_screen()
+            banner("configured", data)
         elif choice == 3:
             print()
             hint("Session not started. Run 'soul-team' to return.")
@@ -1517,6 +1530,11 @@ def _configure_menu(data: dict) -> None:
             _configure_policies(data)
         elif choice == 4:
             _view_config(data)
+
+        # Clear screen when returning from any sub-menu to configure menu
+        if choice != -1:
+            clear_screen()
+            banner("configured", data)
 
 
 def _configure_agents(data: dict) -> None:
@@ -1615,8 +1633,16 @@ def _configure_agents(data: dict) -> None:
             if not agents:
                 warn("No agents configured.")
                 continue
+            # Build machine list from explicit [machines] AND agent entries
             machines_data = data.get("machines", [])
-            machine_names = ["local"] + [m.get("name", "?") for m in machines_data]
+            all_machines: dict[str, str] = {}
+            for m in machines_data:
+                all_machines[m.get("name", "?")] = m.get("ssh", "?")
+            for a in agents:
+                m_name = a.get("machine", "local")
+                if m_name != "local" and m_name not in all_machines:
+                    all_machines[m_name] = a.get("ssh", "unknown")
+            machine_names = ["local"] + list(all_machines.keys())
             if len(machine_names) == 1:
                 warn("Only local machine available. Add machines first.")
                 continue
@@ -1645,10 +1671,18 @@ def _configure_machines(data: dict) -> None:
             m = a.get("machine", "local")
             agent_counts[m] = agent_counts.get(m, 0) + 1
 
-        print(f"    {'local':<20} {'(this machine)':<25} {agent_counts.get('local', 0)} agents")
+        # Build combined machine list from explicit [machines] section
+        # AND from agent entries (which embed machine/ssh info)
+        known_machines: dict[str, str] = {}
         for m in machines:
-            name = m.get("name", "?")
-            ssh = m.get("ssh", "?")
+            known_machines[m.get("name", "?")] = m.get("ssh", "?")
+        for a in agents:
+            m_name = a.get("machine", "local")
+            if m_name != "local" and m_name not in known_machines:
+                known_machines[m_name] = a.get("ssh", "unknown")
+
+        print(f"    {'local':<20} {'(this machine)':<25} {agent_counts.get('local', 0)} agents")
+        for name, ssh in known_machines.items():
             print(f"    {name:<20} {ssh:<25} {agent_counts.get(name, 0)} agents")
         print()
 
@@ -1674,23 +1708,30 @@ def _configure_machines(data: dict) -> None:
             ok(f"Added machine '{name}'")
 
         elif choice == 1:
-            if not machines:
+            if not known_machines:
                 warn("No remote machines to remove.")
                 continue
-            names = [m.get("name", "?") for m in machines]
-            ridx = select_menu("Remove which machine?", names, back_option=True)
+            machine_names_list = list(known_machines.keys())
+            ridx = select_menu("Remove which machine?", machine_names_list, back_option=True)
             if ridx == -1:
                 continue
-            removed = names[ridx]
+            removed = machine_names_list[ridx]
+            # Remove from explicit machines list
             data["machines"] = [m for m in machines if m.get("name") != removed]
             machines = data["machines"]
+            # Reassign any agents on this machine back to local
+            for a in agents:
+                if a.get("machine") == removed:
+                    a["machine"] = "local"
+                    a["cgroup"] = True
             _save_toml_from_dict(data, config_path)
-            ok(f"Removed machine '{removed}'")
+            ok(f"Removed machine '{removed}' (agents reassigned to local)")
 
         elif choice == 2:
-            for m in machines:
-                name = m.get("name", "?")
-                ssh = m.get("ssh", "?")
+            if not known_machines:
+                warn("No remote machines to test.")
+                continue
+            for name, ssh in known_machines.items():
                 print(f"    Testing {name} ({ssh})...", end=" ", flush=True)
                 if test_ssh(ssh):
                     print(f"{GREEN}OK{NC}")
@@ -1830,6 +1871,11 @@ def flow_running(data: dict) -> None:
             print()
             hint("Session still running. Run 'soul-team' to return.")
             return
+
+        # Clear screen when returning from any sub-view to running menu
+        if choice in (1, 2, 3, 4, 6):
+            clear_screen()
+            banner("running", data)
 
 
 def _attach_session(team_name: str) -> None:
