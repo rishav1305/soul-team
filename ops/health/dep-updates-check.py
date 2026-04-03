@@ -3,7 +3,7 @@
 dep-updates-check.py -- Check Go and npm dependency updates for soul-v2.
 
 Runs 'go list -m -u all' and 'npm outdated --json', writes combined report
-to ~/.soul/health/dep-updates.json. Uses /usr/bin/go per titan-pc config.
+to ~/.soul/health/dep-updates.json. Uses /usr/bin/go (or go on PATH).
 
 Author: Banner (Data Science, Soul Team)
 Date: 2026-03-30

@@ -19,13 +19,13 @@ OUTPUT_FILE = Path.home() / ".soul" / "health" / "services.json"
 TIMEOUT_SECONDS = 30
 
 # Service definitions: (name, user_service)
-# soul-v2 is a SYSTEM service on titan-pi (not titan-pc) — skipped here.
-# soul-guardian, soul-courier, soul-router are USER services on titan-pc.
+# soul-v2 is a SYSTEM service on primary (not worker) -- skipped here.
+# soul-guardian, soul-courier, soul-router are USER services on worker.
 SERVICES = [
-    ("soul-guardian", True),   # user service on titan-pc
-    ("soul-courier", True),    # user service on titan-pc
-    ("soul-router", True),     # user service on titan-pc
-    # ("soul-v2", False),      # system service on titan-pi only — not checked from titan-pc
+    ("soul-guardian", True),   # user service on worker
+    ("soul-courier", True),    # user service on worker
+    ("soul-router", True),     # user service on worker
+    # ("soul-v2", False),      # system service on primary only -- not checked from worker
 ]
 
 

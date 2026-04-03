@@ -28,7 +28,7 @@ How to add new roles and integrate new soul-v2 products into the AI leadership t
 
 ```bash
 mkdir -p ~/soul-roles/{role-id}/.claude/skills
-ln -s /home/rishav/soul-v2 ~/soul-roles/{role-id}/soul-v2
+ln -s $HOME/soul-v2 ~/soul-roles/{role-id}/soul-v2
 mkdir -p ~/soul-roles/shared/inbox/{role-id}/archive
 ```
 
@@ -133,10 +133,10 @@ Only symlink skills this role needs as local skills. Plugin skills (superpowers,
 
 ```bash
 # Example: symlink daily-planner for a role that needs it
-ln -s /home/rishav/soul-old/.claude/skills/daily-planner ~/soul-roles/{role-id}/.claude/skills/daily-planner
+ln -s $HOME/soul-old/.claude/skills/daily-planner ~/soul-roles/{role-id}/.claude/skills/daily-planner
 
 # Example: symlink soul-pm for a dev-oriented role
-ln -s /home/rishav/soul-v2/.claude/skills/soul-pm ~/soul-roles/{role-id}/.claude/skills/soul-pm
+ln -s $HOME/soul-v2/.claude/skills/soul-pm ~/soul-roles/{role-id}/.claude/skills/soul-pm
 ```
 
 Available local skills to symlink:

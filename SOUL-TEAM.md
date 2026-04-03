@@ -23,7 +23,7 @@ This opens a tmux session with 10 panes (CEO + 9 agents) in a 4-column layout:
 │              │ Hawkeye  │ Loki     │ Banner*  │
 └──────────────┴──────────┴──────────┴──────────┘
 
-* = runs on titan-pc via SSH
+* = runs on worker machine via SSH
 ```
 
 Launch takes ~2 minutes. Agents start sequentially with 10s stagger to avoid CPU spikes.
@@ -53,7 +53,7 @@ soul-monitor --bar  # One-line status bar
 soul-shutdown "end of day"
 ```
 
-Gracefully saves state, kills agents, shuts down titan-pc, then titan-pi.
+Gracefully saves state, kills agents, shuts down worker machine, then primary.
 
 ---
 
@@ -63,28 +63,28 @@ Gracefully saves state, kills agents, shuts down titan-pc, then titan-pi.
 
 | Machine | Host | Specs | Role |
 |---------|------|-------|------|
-| **titan-pi** | 192.168.0.128 | RPi aarch64, 4 cores, 15 GB RAM | Primary — runs 6 agents, CEO, all daemons |
-| **titan-pc** | 192.168.0.196 | x86, 6 cores, 7.6 GB RAM | Compute — runs 3 heavy agents (Shuri, Stark, Banner) |
+| **primary** | (your primary IP) | Always-on machine (e.g. RPi, home server) | Primary -- runs 6 agents, CEO, all daemons |
+| **worker** | (your worker IP) | High-compute machine (e.g. desktop, workstation) | Compute -- runs 3 heavy agents (Shuri, Stark, Banner) |
 
-titan-pi is the **source of truth**. Agent definitions, skills, and shared state live here. titan-pc accesses them via sshfs mounts (`soul-mounts.service`).
+The primary machine is the **source of truth**. Agent definitions, skills, and shared state live here. The worker accesses them via sshfs mounts (`soul-mounts.service`).
 
 ### The Team
 
 | Agent | Model | Machine | Domain | Key Products |
 |-------|-------|---------|--------|-------------|
-| **Friday** | Sonnet | titan-pi | Personal Assistant | Schedule, tasks, journal, meetings, people directory |
-| **Shuri** | Sonnet | titan-pc | Technical PM | Builds soul-v2, ships code, sprint execution |
-| **Loki** | Opus | titan-pi | Brand & Growth | SEO, content strategy, Scout content pipeline |
-| **Fury** | Opus | titan-pi | Strategy Advisor | Market analysis, positioning, competitive intel |
-| **Xavier** | Opus | titan-pi | Interview Coach | DSA drilling, mock interviews, Tutor product (`:3006`) |
-| **Hawkeye** | Opus | titan-pi | Pipeline Ops | Lead management, Scout product (`:3020`) |
-| **Stark** | Opus | titan-pc | Financial Analyst | Stock trading, portfolio management (Angel One) |
-| **Banner** | Opus | titan-pc | Data Scientist | EDA, ML, visualization, statistical analysis |
-| **Pepper** | Opus | titan-pi | Program Manager | Product oversight, roadmaps, gap analysis |
+| **Friday** | Sonnet | primary | Personal Assistant | Schedule, tasks, journal, meetings, people directory |
+| **Shuri** | Sonnet | worker | Technical PM | Builds soul-v2, ships code, sprint execution |
+| **Loki** | Opus | primary | Brand & Growth | SEO, content strategy, Scout content pipeline |
+| **Fury** | Opus | primary | Strategy Advisor | Market analysis, positioning, competitive intel |
+| **Xavier** | Opus | primary | Interview Coach | DSA drilling, mock interviews, Tutor product (`:3006`) |
+| **Hawkeye** | Opus | primary | Pipeline Ops | Lead management, Scout product (`:3020`) |
+| **Stark** | Opus | worker | Financial Analyst | Stock trading, portfolio management |
+| **Banner** | Opus | worker | Data Scientist | EDA, ML, visualization, statistical analysis |
+| **Pepper** | Opus | primary | Program Manager | Product oversight, roadmaps, gap analysis |
 
 ### Shared Filesystem
 
-titan-pc mounts these from titan-pi via sshfs:
+The worker machine mounts these from the primary via sshfs:
 
 ```
 ~/.claude/agents/     → agent persona definitions
@@ -93,7 +93,7 @@ titan-pc mounts these from titan-pi via sshfs:
 ~/soul-v2/            → codebase (for Shuri)
 ```
 
-**Rule:** Edit agents/skills ONLY on titan-pi. titan-pc sees changes instantly via sshfs.
+**Rule:** Edit agents/skills ONLY on the primary machine. The worker sees changes instantly via sshfs.
 
 ---
 
@@ -255,11 +255,11 @@ All local agents run under `soul-agents.slice`:
 
 ### CPU Governor
 
-titan-pi runs conservative governor at max 1.8 GHz. Persisted via `/etc/default/cpufrequtils`.
+The primary machine can run a conservative CPU governor (e.g., max 1.8 GHz). Persisted via `/etc/default/cpufrequtils`.
 
 ### Power Budget
 
-RPi has 3A PSU. **Never run all 9 agents on titan-pi alone** — always distribute Shuri, Stark, Banner to titan-pc.
+Low-power primary machines have limited PSU. **Never run all 9 agents on the primary alone** -- always distribute heavy agents (Shuri, Stark, Banner) to the worker.
 
 ---
 
@@ -401,8 +401,8 @@ Each agent is defined in `~/.claude/agents/{agent}.md` with:
 2. **Save state** — Dumps tmux sessions, claude processes, service status
 3. **Stop daemons** — Kills sidecars, router, bridge, heartbeat
 4. **Kill tmux** — `tmux kill-session -t soul-team`
-5. **Shutdown titan-pc** — SSH `sudo shutdown now`
-6. **Shutdown titan-pi** — `sudo shutdown now` (5s grace, Ctrl+C to abort)
+5. **Shutdown worker** -- SSH `sudo shutdown now`
+6. **Shutdown primary** -- `sudo shutdown now` (5s grace, Ctrl+C to abort)
 
 ---
 
@@ -427,9 +427,9 @@ See `~/soul-roles/GUIDE.md` for the full checklist. Summary:
 
 2. **File-based IPC** — All communication uses the filesystem (markdown files, JSON). No databases, no network protocols, no message brokers. Simple, debuggable, grep-able.
 
-3. **titan-pi is source of truth** — All agent definitions, skills, and shared state originate here. titan-pc reads via sshfs.
+3. **Primary is source of truth** -- All agent definitions, skills, and shared state originate here. Worker reads via sshfs.
 
-4. **Graceful degradation** — If titan-pc goes down, 6 agents continue on titan-pi. If an agent crashes, guardian auto-heals. If context fills, sidecars send summaries.
+4. **Graceful degradation** -- If the worker goes down, 6 agents continue on the primary. If an agent crashes, guardian auto-heals. If context fills, sidecars send summaries.
 
 5. **Cost containment** — $60/day spend cap, token tracking per agent, non-critical agents paused under pressure, sonnet for routine work, opus for judgment.
 

@@ -16,7 +16,7 @@ Output JSON structure:
         {"name": "pepper", "model": "sonnet", "machine": "local"},
         ...
     ],
-    "agent_machines": {"pepper": "local", "shuri": "titan-pc", ...}
+    "agent_machines": {"pepper": "local", "shuri": "worker", ...}
 }
 """
 

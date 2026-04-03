@@ -79,14 +79,14 @@ def sample_toml(tmp_path):
         [[agents]]
         name = "happy"
         model = "sonnet"
-        machine = "titan-pc"
-        ssh = "user@192.168.0.196"
+        machine = "worker"
+        ssh = "user@10.0.0.2"
         cgroup = false
 
         [[agents]]
         name = "shuri"
         model = "opus"
-        machine = "titan-pc"
+        machine = "worker"
         cgroup = false
 
         [[agents]]
@@ -121,8 +121,8 @@ def agent_state():
 def machines_config_file(tmp_path):
     """Write a sample machines.json and return its path."""
     cfg = {
-        "titan-pc": {
-            "ssh_target": "rishav@192.168.0.196",
+        "worker": {
+            "ssh_target": "user@10.0.0.2",
             "ssh_args": ["-o", "ConnectTimeout=5"],
         }
     }
@@ -245,8 +245,8 @@ class TestConfigLoading:
         soul_guardian.MACHINES_JSON = machines_config_file
         try:
             cfg = soul_guardian.load_machines_config()
-            assert "titan-pc" in cfg
-            assert cfg["titan-pc"]["ssh_target"] == "rishav@192.168.0.196"
+            assert "worker" in cfg
+            assert cfg["worker"]["ssh_target"] == "user@10.0.0.2"
         finally:
             soul_guardian.MACHINES_JSON = original
 
@@ -304,8 +304,8 @@ class TestHealthCheckLogic:
     # -- pane_is_shell_prompt --
 
     @pytest.mark.parametrize("prompt,expected", [
-        ("rishav@titan-pi:~$", True),
-        ("rishav@titan-pi:~/soul-v2$ ", True),
+        ("user@primary:~$", True),
+        ("user@primary:~/soul-v2$ ", True),
         ("root@server:/home# ", True),
         ("$ ", True),
         ("# ", True),
@@ -313,7 +313,7 @@ class TestHealthCheckLogic:
         ("bash-5.2#", True),
         ("sh-5.1$", True),
         ("user@host:~$", True),
-        ("rishav@titan-pc:/home/rishav$", True),
+        ("user@worker:/home/user$", True),
         # Negative cases -- Claude TUI output should NOT match
         ("Thinking...", False),
         ("Running: npm test", False),
@@ -380,7 +380,7 @@ class TestRestartLogic:
         result = soul_guardian.maybe_restart_agent(agent_state, in_memory_db)
         assert result is False
 
-    @patch.object(soul_guardian, "capture_pane", return_value="rishav@titan-pi:~$ \n")
+    @patch.object(soul_guardian, "capture_pane", return_value="user@primary:~$ \n")
     def test_maybe_restart_triggers_on_shell_prompt(self, mock_cp, agent_state, in_memory_db):
         """Restart triggered when shell prompt is detected."""
         soul_guardian._last_restart_ts = 0.0  # no stagger
@@ -395,14 +395,14 @@ class TestRestartLogic:
         assert len(agent_state.restart_timestamps) == 1
         assert agent_state.status == "active"
 
-    @patch.object(soul_guardian, "capture_pane", return_value="rishav@titan-pi:~$ \n")
+    @patch.object(soul_guardian, "capture_pane", return_value="user@primary:~$ \n")
     def test_maybe_restart_stagger_blocks(self, mock_cp, agent_state, in_memory_db):
         """Restart blocked when stagger timer hasn't expired."""
         soul_guardian._last_restart_ts = time.time() - 10  # only 10s ago, stagger=90s
         result = soul_guardian.maybe_restart_agent(agent_state, in_memory_db)
         assert result is False
 
-    @patch.object(soul_guardian, "capture_pane", return_value="rishav@titan-pi:~$ \n")
+    @patch.object(soul_guardian, "capture_pane", return_value="user@primary:~$ \n")
     def test_maybe_restart_rate_limit(self, mock_cp, agent_state, in_memory_db):
         """Restart blocked when per-agent rate limit (3/hr) is reached."""
         now = time.time()
@@ -417,7 +417,7 @@ class TestRestartLogic:
         result = soul_guardian.maybe_restart_agent(agent_state, in_memory_db)
         assert result is False
 
-    @patch.object(soul_guardian, "capture_pane", return_value="rishav@titan-pi:~$ \n")
+    @patch.object(soul_guardian, "capture_pane", return_value="user@primary:~$ \n")
     def test_maybe_restart_dry_run(self, mock_cp, agent_state, in_memory_db):
         """Dry run detects condition but doesn't restart."""
         soul_guardian._last_restart_ts = 0.0
@@ -621,17 +621,17 @@ class TestBuildLaunchCmd:
     def test_remote_agent_returns_ssh(self):
         """Remote agent gets launched via SSH."""
         soul_guardian._machines_config = {
-            "titan-pc": {
-                "ssh_target": "rishav@192.168.0.196",
+            "worker": {
+                "ssh_target": "user@10.0.0.2",
                 "ssh_args": ["-o", "ConnectTimeout=5"],
             }
         }
-        cmd = soul_guardian.build_launch_cmd("shuri", "opus", "titan-pc")
+        cmd = soul_guardian.build_launch_cmd("shuri", "opus", "worker")
         assert cmd is not None
         assert cmd[0] == "ssh"
         assert "-o" in cmd
         assert "ConnectTimeout=5" in cmd
-        assert "rishav@192.168.0.196" in cmd
+        assert "user@10.0.0.2" in cmd
 
     def test_model_mapping_sonnet(self):
         """Model 'sonnet' maps to 'claude-sonnet-4-6'."""

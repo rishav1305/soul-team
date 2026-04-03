@@ -129,7 +129,7 @@ class TestSSHIntegration:
 
     @pytest.fixture
     def ssh_target(self):
-        target = os.environ.get("TEST_SSH_TARGET", "rishav@192.168.0.196")
+        target = os.environ.get("TEST_SSH_TARGET", "user@remote-host")
         result = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", target, "echo ok"],
             capture_output=True, text=True, timeout=10,

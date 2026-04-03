@@ -2,17 +2,17 @@
 # soul-heartbeat.sh — Writes a heartbeat JSON every 30s to ~/.clawteam/heartbeat/
 #
 # Purpose: Guardian reads heartbeat files to detect cross-machine connectivity.
-# If titan-pc heartbeat goes stale (>60s), guardian marks those agents unreachable.
+# If the worker heartbeat goes stale (>60s), guardian marks those agents unreachable.
 #
 # Run as: background subshell launched by soul-team.sh
-#   ( /home/rishav/.claude/scripts/soul-heartbeat.sh & )
+#   ( $HOME/.claude/scripts/soul-heartbeat.sh & )
 #
 # Writes: ~/.clawteam/heartbeat/{hostname}.json
-# Format: {"ts": "ISO8601", "hostname": "titan-pi", "agents": ["happy", ...]}
+# Format: {"ts": "ISO8601", "hostname": "<hostname>", "agents": ["agent1", ...]}
 
 set -euo pipefail
 
-HEARTBEAT_DIR="/home/rishav/.clawteam/heartbeat"
+HEARTBEAT_DIR="${HOME}/.clawteam/heartbeat"
 HOSTNAME_SHORT=$(hostname -s)
 INTERVAL=30
 

@@ -7,7 +7,7 @@ REASON="${1:-Power failure - manual trigger}"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 LOG_FILE="$HOME/soul-roles/shared/briefs/sentinel-power-log.md"
 STATE_FILE="$HOME/soul-roles/shared/briefs/sentinel-state-dump.md"
-TITAN_PC="rishav@192.168.0.196"
+TITAN_PC="${SOUL_WORKER_SSH:-user@worker-host}"
 
 echo "=== SOUL SHUTDOWN PROTOCOL ==="
 echo "Reason: $REASON"
@@ -44,8 +44,9 @@ echo ">> Step 2/6: Saving state..."
   echo "### Service status"
   systemctl is-active soul-v2 2>/dev/null && echo "soul-v2: running" || echo "soul-v2: stopped"
   echo ""
-  echo "### titan-pc reachable"
-  ping -c 1 -W 2 192.168.0.196 >/dev/null 2>&1 && echo "titan-pc: UP" || echo "titan-pc: DOWN"
+  echo "### worker reachable"
+  WORKER_HOST="${SOUL_WORKER_HOST:-worker-host}"
+  ping -c 1 -W 2 "$WORKER_HOST" >/dev/null 2>&1 && echo "worker: UP" || echo "worker: DOWN"
   echo ""
 } >> "$STATE_FILE"
 echo "   State saved to $STATE_FILE"
@@ -88,16 +89,17 @@ echo ">> Step 4/6: Stopping services..."
 sudo systemctl stop soul-v2 2>/dev/null && echo "   soul-v2 stopped" || echo "   soul-v2 was not running"
 
 # 5. SHUTDOWN TITAN-PC
-echo ">> Step 5/6: Shutting down titan-pc..."
-if ping -c 1 -W 2 192.168.0.196 >/dev/null 2>&1; then
+echo ">> Step 5/6: Shutting down worker..."
+WORKER_IP="${SOUL_WORKER_HOST:-worker-host}"
+if ping -c 1 -W 2 "$WORKER_IP" >/dev/null 2>&1; then
   ssh -o ConnectTimeout=5 "$TITAN_PC" "sudo shutdown now" 2>/dev/null
-  echo "   titan-pc shutdown initiated"
+  echo "   worker shutdown initiated"
 else
-  echo "   titan-pc unreachable (already down or disconnected)"
+  echo "   worker unreachable (already down or disconnected)"
 fi
 
 # 6. SHUTDOWN TITAN-PI
-echo ">> Step 6/6: Shutting down titan-pi in 5 seconds..."
+echo ">> Step 6/6: Shutting down primary in 5 seconds..."
 echo "   (Ctrl+C to abort)"
 sleep 5
 sudo shutdown now

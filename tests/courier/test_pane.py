@@ -21,7 +21,7 @@ def test_detect_state_dead_capture_fails():
 
 def test_detect_state_crashed():
     pm = _make_pm()
-    content = "some output\nrishav@titan-pi:~$ \n"
+    content = "some output\nuser@host:~$ \n"
     with patch.object(pm, "_tmux_capture", return_value=content):
         assert pm.detect_state("fury") == "crashed"
 

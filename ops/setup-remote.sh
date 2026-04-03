@@ -34,7 +34,7 @@ step() { echo -e "\n${BOLD}--- Step $1: $2 ---${NC}"; }
 # ── Parse arguments ──────────────────────────────────────────────────────────
 
 SSH_TARGET="${1:-}"
-REPO_URL="${2:-ssh://git@git.titan.local:222/admin/soul-team.git}"
+REPO_URL="${2:-${SOUL_REPO_URL:-https://github.com/rishav1305/soul-team.git}}"
 PRIMARY_HOST="${3:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 PRIMARY_USER="${4:-$(whoami)}"
 CONFIG_FILE="${5:-${HOME}/.soul-team/config.toml}"
@@ -42,7 +42,7 @@ CONFIG_FILE="${5:-${HOME}/.soul-team/config.toml}"
 if [[ -z "$SSH_TARGET" ]]; then
     echo "Usage: setup-remote.sh <ssh-target> [repo-url] [primary-host] [primary-user] [config-file]"
     echo ""
-    echo "  ssh-target:   user@host (e.g. rishav@192.168.0.196)"
+    echo "  ssh-target:   user@host (e.g. user@10.0.0.2)"
     echo "  repo-url:     Git repo URL (default: Gitea soul-team)"
     echo "  primary-host: IP of the primary machine (default: auto-detect)"
     echo "  primary-user: Username on primary machine (default: current user)"

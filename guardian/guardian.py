@@ -1561,7 +1561,7 @@ def parse_tokens_from_pane(output: str) -> dict:
 def _refresh_agent_jsonl_map() -> None:
     """Scan ~/.claude/projects/ to find the active JSONL file per agent.
 
-    Scans local project dirs. For remote machines (titan-pc), uses SSH to
+    Scans local project dirs. For remote machines (worker), uses SSH to
     find the active JSONL and copies incremental data.
     """
     global _agent_jsonl_map, _jsonl_map_refresh_ts

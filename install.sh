@@ -2,7 +2,7 @@
 # soul-team — one-line installer
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/rishav1305/soul-team/main/install.sh | bash
-#   curl -fsSL http://git.titan.local:3000/admin/soul-team/raw/branch/main/install.sh | bash
+#   curl -fsSL http://your-gitea-host:3000/admin/soul-team/raw/branch/main/install.sh | bash
 #
 # Options (via env vars):
 #   SOUL_DIR=~/my-team    — install location (default: ~/soul-team)
@@ -25,7 +25,7 @@ REMOTE="${SOUL_REMOTE:-github}"
 
 # Remote URLs
 GITHUB_URL="https://github.com/rishav1305/soul-team.git"
-GITEA_URL="ssh://git@git.titan.local:222/admin/soul-team.git"
+GITEA_URL="${SOUL_GITEA_URL:-ssh://git@your-gitea-host:222/admin/soul-team.git}"
 
 echo ""
 echo -e "${BOLD}soul-team installer${NC}"

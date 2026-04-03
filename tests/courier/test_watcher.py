@@ -27,7 +27,7 @@ def test_on_moved_dispatches():
     w = InboxWatcher(callback=cb)
     event = FileMovedEvent(
         src_path="/tmp/.tmp-123.json",
-        dest_path="/home/rishav/.clawteam/teams/soul-team/inboxes/fury_fury/msg-123.json",
+        dest_path="/home/testuser/.clawteam/teams/soul-team/inboxes/fury_fury/msg-123.json",
     )
     w.on_moved(event)
     cb.assert_called_once()
@@ -42,7 +42,7 @@ def test_on_moved_dispatches_new_subdir():
     w = InboxWatcher(callback=cb)
     event = FileMovedEvent(
         src_path="/tmp/.tmp-456.json",
-        dest_path="/home/rishav/.clawteam/teams/soul-team/inboxes/fury_fury/new/msg-456.json",
+        dest_path="/home/testuser/.clawteam/teams/soul-team/inboxes/fury_fury/new/msg-456.json",
     )
     w.on_moved(event)
     cb.assert_called_once()
@@ -54,7 +54,7 @@ def test_on_created_dispatches():
     cb = MagicMock()
     w = InboxWatcher(callback=cb)
     event = FileCreatedEvent(
-        src_path="/home/rishav/.clawteam/teams/soul-team/inboxes/fury_fury/new/msg-mcp-1.json",
+        src_path="/home/testuser/.clawteam/teams/soul-team/inboxes/fury_fury/new/msg-mcp-1.json",
     )
     w.on_created(event)
     cb.assert_called_once()

@@ -1,8 +1,8 @@
 # Guardian Refactor Decomposition Plan
 
 **Status:** PLANNING (do not implement until approved)
-**Source:** `/home/rishav/.claude/scripts/soul-guardian.py` (2,099 lines, single file)
-**Test suite:** `/home/rishav/.claude/scripts/tests/test_guardian.py` (110 tests, 13 test classes)
+**Source:** `guardian/guardian.py` (2,099 lines, single file)
+**Test suite:** `tests/test_guardian.py` (110 tests, 13 test classes)
 **Author:** Shuri (Phase 3C, soul-team remediation plan)
 **Date:** 2026-03-31
 
