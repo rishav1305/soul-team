@@ -19,7 +19,7 @@ from ops.health import (
 
 
 class TestCheckServiceActive:
-    """STQA2-2.1: 5 tests for check_service_active."""
+    """STQA2-2.1: 6 tests for check_service_active (5 spec + 1 edge case)."""
 
     @patch("ops.health.subprocess.run")
     def test_active_returns_true(self, mock_run):
@@ -49,9 +49,15 @@ class TestCheckServiceActive:
         mock_run.side_effect = subprocess.TimeoutExpired(cmd="systemctl", timeout=10)
         assert check_service_active("sshd") is False
 
+    @patch("ops.health.subprocess.run")
+    def test_generic_exception_returns_false(self, mock_run):
+        """Any unexpected exception must not propagate — Guardian v2 stability contract."""
+        mock_run.side_effect = OSError("unexpected os error")
+        assert check_service_active("sshd") is False
+
 
 class TestCheckDockerContainer:
-    """STQA2-2.2: 4 tests for check_docker_container."""
+    """STQA2-2.2: 6 tests for check_docker_container (4 spec + 2 edge cases)."""
 
     @patch("ops.health.subprocess.run")
     def test_running_returns_true(self, mock_run):
@@ -73,9 +79,21 @@ class TestCheckDockerContainer:
         mock_run.side_effect = subprocess.TimeoutExpired(cmd="docker", timeout=10)
         assert check_docker_container("gitea") is False
 
+    @patch("ops.health.subprocess.run")
+    def test_docker_not_installed_returns_false(self, mock_run):
+        """docker binary absent → FileNotFoundError → False (not a crash)."""
+        mock_run.side_effect = FileNotFoundError("docker not found")
+        assert check_docker_container("gitea") is False
+
+    @patch("ops.health.subprocess.run")
+    def test_paused_container_returns_false(self, mock_run):
+        """Status 'paused' must not be treated as 'running'."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="paused\n")
+        assert check_docker_container("gitea") is False
+
 
 class TestCheckDiskUsage:
-    """STQA2-2.3: 3 tests for check_disk_usage."""
+    """STQA2-2.3: 4 tests for check_disk_usage (3 spec + 1 edge case)."""
 
     @patch("ops.health.shutil.disk_usage")
     def test_correct_values(self, mock_usage):
@@ -106,6 +124,12 @@ class TestCheckDiskUsage:
         used, total, pct = check_disk_usage("/")
         assert pct == 95.0
         assert used == 950.0
+
+    @patch("ops.health.shutil.disk_usage")
+    def test_oserror_returns_zeros(self, mock_usage):
+        """OSError (e.g. path doesn't exist) must not propagate."""
+        mock_usage.side_effect = OSError("No such file or directory")
+        assert check_disk_usage("/nonexistent") == (0.0, 0.0, 0.0)
 
 
 class TestCheckMemoryPressure:
