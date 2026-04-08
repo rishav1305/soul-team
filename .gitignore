@@ -83,6 +83,9 @@ chat-history/
 session-data/
 sessions/
 
+# ── Claude Code project memory (PII risk — synced via rsync, not git) ──
+.claude/memory/
+
 # ── Inbox / queue / courier ─────────────────────────────────
 inboxes/
 inbox/
@@ -97,6 +100,7 @@ sidecar/
 guardian_state.json
 agent_snapshots/
 health/
+!ops/health/
 preflight/
 heartbeat/
 heartbeat*.json

@@ -1,0 +1,9 @@
+{
+  "generated": "2026-04-08T18:10:00Z",
+  "platform": "titan-gpu (Ubuntu 24.04, Python 3.12.3)",
+  "courier_version": "soul-courier 1.0",
+  "p50_single_ms": 202,
+  "p95_single_ms": 605,
+  "batch_100_s": 21.0,
+  "notes": "Courier has 200ms settle delay per message in _on_new_message. p50 ~202ms is expected floor. Batch 100 messages to 5 agents takes ~21s due to sequential processing."
+}
